@@ -1,0 +1,25 @@
+import { send } from '@sendgrid/mail';
+
+// Replace with your SendGrid API key
+send.setApiKey(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);
+
+// Email sending handler
+export async function handleRequest(request) {
+    // Read the incoming JSON payload (e.g., from the signup form)
+    const { to, subject, text, html } = await request.json();
+
+    // Send the email using SendGrid
+    try {
+        await send({
+            to: to, // recipient's email address
+            from: 'noreply@itsjust.us', // your sending email
+            subject: subject, // email subject
+            text: text, // plain text body
+            html: html, // HTML body
+        });
+
+        return new Response('Email sent successfully!', { status: 200 });
+    } catch (error) {
+        return new Response('Error sending email: ' + error.message, { status: 500 });
+    }
+}

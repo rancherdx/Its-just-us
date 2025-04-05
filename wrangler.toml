@@ -1,0 +1,38 @@
+name = "its-just-us"
+main = "src/index.js"
+compatibility_date = "2025-03-27"
+
+assets = { directory = "./public" }
+
+[[d1_databases]]
+binding = "D1_DB"                     # Reference name in your Worker code
+database_name = "its-just-us"         # The actual database name
+database_id = "f2c6a39c-935d-4720-8367-5a2ea6b975d5"  # Your D1 database ID
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MyDurableObject"]
+
+[durable_objects]
+bindings = [
+  { name = "MY_DURABLE_OBJECT", class_name = "MyDurableObject" }
+]
+
+[observability]
+enabled = true
+
+# 🔥 Added R2 Storage Buckets
+[[r2_buckets]]
+binding = "USER_MEDIA_BUCKET"           # Variable name in Worker code
+bucket_name = "user-media"              # Actual Cloudflare R2 bucket name
+preview_bucket_name = "user-media-preview" # Optional: Preview bucket
+
+[[r2_buckets]]
+binding = "LIVESTREAMS_BUCKET"
+bucket_name = "livestreams"
+preview_bucket_name = "livestreams-preview"
+
+[[r2_buckets]]
+binding = "CONTENT_STORAGE_BUCKET"
+bucket_name = "content-storage"
+preview_bucket_name = "content-storage-preview"
