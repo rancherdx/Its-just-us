@@ -2,45 +2,57 @@ import React, { useState, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import api from "../services/api"; // Assuming this path is correct
 
+/**
+ * ResetPassword component.
+ * This page allows users to set a new password using a token provided in the URL.
+ * The token is typically received via an email link.
+ * It validates the token and new password, then communicates with the backend API.
+ */
 function ResetPassword() {
-  const [searchParams] = useSearchParams();
-  const navigate = useNavigate();
+  const [searchParams] = useSearchParams(); // Hook to access URL query parameters
+  const navigate = useNavigate(); // Hook for programmatic navigation
   const [token, setToken] = useState(null);
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [message, setMessage] = useState("");
-  const [error, setError] = useState(""); // Specific for validation errors or API errors
+  const [error, setError] = useState(""); // State for displaying validation or API error messages
 
+  // useEffect hook to extract the 'token' from the URL query parameters when the component mounts.
   useEffect(() => {
     const urlToken = searchParams.get("token");
     if (urlToken) {
-      setToken(urlToken);
+      setToken(urlToken); // Store the found token in state
     } else {
+      // If no token is found in the URL, set an error message.
       setError("Password reset token not found in URL. Please use the link from your email.");
     }
-  }, [searchParams]);
+  }, [searchParams]); // Dependency array ensures this effect runs when searchParams change.
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    setMessage("");
-    setError("");
+    setMessage(""); // Clear previous success messages
+    setError("");   // Clear previous error messages
 
+    // Ensure a token was found and is available.
     if (!token) {
       setError("Cannot reset password without a token. Please use the link from your email.");
       return;
     }
 
+    // Client-side validation: Check if passwords match.
     if (newPassword !== confirmPassword) {
       setError("Passwords do not match.");
       return;
     }
 
-    if (newPassword.length < 6) { // Basic password length validation
+    // Client-side validation: Basic password length check.
+    if (newPassword.length < 6) {
         setError("Password must be at least 6 characters long.");
         return;
     }
 
     try {
+      // Make API call to reset the password
       const response = await api.post("/api/auth/reset-password", { token, newPassword });
       if (response.data && response.data.message) {
         setMessage(response.data.message + " You can now log in with your new password.");

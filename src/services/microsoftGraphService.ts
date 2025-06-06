@@ -1,16 +1,30 @@
 // src/services/microsoftGraphService.ts
 
+/**
+ * Defines the structure for environment variables required by the Microsoft Graph service.
+ * These variables are expected to be available in the Cloudflare Worker's environment.
+ */
 interface Env {
+  /** The Azure AD application (client) ID for MS Graph authentication. */
   MS_GRAPH_CLIENT_ID: string;
+  /** The client secret for the Azure AD application. */
   MS_GRAPH_CLIENT_SECRET: string;
+  /** The Azure AD tenant ID. */
   MS_GRAPH_TENANT_ID: string;
-  MS_GRAPH_SENDING_USER_ID: string; // User ID or UPN of the sending mailbox
-  // ... other environment variables
+  /** The User ID or User Principal Name (UPN) of the mailbox from which emails will be sent. */
+  MS_GRAPH_SENDING_USER_ID: string;
+  // ... other environment variables that might be present but not used by this service
 }
 
+/**
+ * Defines the structure for the arguments required to send an email.
+ */
 interface EmailArgs {
+  /** The recipient's email address. */
   to: string;
+  /** The subject line of the email. */
   subject: string;
+  /** The HTML content of the email body. */
   htmlBody: string;
 }
 
@@ -57,7 +71,8 @@ async function getAccessToken(env: Env): Promise<string> {
 
     tokenCache = {
       accessToken: data.access_token,
-      // Cache token for slightly less than its actual expiry to be safe (e.g., 5 minutes buffer)
+      // Reduce token's actual lifetime by 300 seconds (5 minutes) to ensure it's refreshed before actual expiry,
+      // mitigating potential clock skew issues or propagation delays.
       expiresAt: Date.now() + (data.expires_in - 300) * 1000,
     };
     console.log("Successfully obtained new MS Graph token");
@@ -69,6 +84,15 @@ async function getAccessToken(env: Env): Promise<string> {
   }
 }
 
+/**
+ * Sends an email using the Microsoft Graph API.
+ * It handles acquiring an access token (and caching it) and then making the send mail request.
+ *
+ * @param env The environment object containing necessary MS Graph credentials.
+ * @param emailArgs An object containing the recipient, subject, and HTML body of the email.
+ * @returns A promise that resolves to `true` if the email is sent successfully (status 202),
+ *          and `false` otherwise. Logs errors to the console.
+ */
 export async function sendEmail(env: Env, { to, subject, htmlBody }: EmailArgs): Promise<boolean> {
   console.log(`Attempting to send email to: ${to} with subject: ${subject}`);
   try {
@@ -91,7 +115,9 @@ export async function sendEmail(env: Env, { to, subject, htmlBody }: EmailArgs):
           },
         ],
       },
-      saveToSentItems: 'true', // Optional: Save a copy in the sender's Sent Items
+      // Saves a copy of the sent email in the sender's "Sent Items" folder.
+      // Set to 'false' if this behavior is not desired.
+      saveToSentItems: 'true',
     };
 
     const response = await fetch(sendMailUrl, {
