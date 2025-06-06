@@ -166,25 +166,27 @@ export default {
 
         // Check if user exists
         const user = await env.D1_DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+        // Important: To prevent user enumeration attacks, always return a generic success message,
+        // regardless of whether the email address is registered in the system.
         if (!user) {
-          // Important: Do not reveal if an email exists or not for security reasons.
-          // Send a generic success message regardless.
-          console.log(`Password reset requested for non-existent email (or existing, no indication): ${email}`);
+          console.log(`Password reset requested for non-existent email (or existing, no indication given to client): ${email}`);
           return new Response(JSON.stringify({ message: "If your email is registered, you will receive a password reset link." }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
 
-        const plainToken = crypto.randomUUID(); // Generate a secure random token
-        const hashedToken = await hashPassword(plainToken); // Use existing hashPassword function
+        // Generate a cryptographically secure random token for the password reset link.
+        const plainToken = crypto.randomUUID();
+        // Hash the plain token before storing it in the database for security.
+        const hashedToken = await hashPassword(plainToken);
 
-        const expiryMinutes = 60; // Token valid for 60 minutes
+        const expiryMinutes = 60; // Token will be valid for 60 minutes.
         const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000).toISOString();
 
-        // Store hashed token, associated email, and expiry in D1
+        // Store the hashed token, the user's email, and the token's expiration time in the database.
         await env.D1_DB.prepare(
           "INSERT INTO password_reset_tokens (email, token_hash, expires_at) VALUES (?, ?, ?)"
         ).bind(email, hashedToken, expiresAt).run();
 
-        // Send password reset email
+        // Prepare and send the password reset email.
         // Placeholder for frontend URL - ideally from env variable
         const frontendBaseUrl = env.FRONTEND_URL || "http://localhost:3000"; // Replace with actual env var later
         const resetLink = `${frontendBaseUrl}/reset-password?token=${plainToken}`;
@@ -218,42 +220,46 @@ export default {
           return new Response(JSON.stringify({ message: "Token and new password are required." }), { status: 400, headers: { "Content-Type": "application/json" } });
         }
 
-        const hashedToken = await hashPassword(token); // Hash the plain token from the client
+        // Hash the plain token received from the client to compare with the stored hashed token.
+        const hashedToken = await hashPassword(token);
 
-        // Find token in D1
+        // Attempt to find the token in the database.
         const tokenEntry = await env.D1_DB.prepare(
           "SELECT email, expires_at FROM password_reset_tokens WHERE token_hash = ?"
         ).bind(hashedToken).first();
 
+        // If no token entry is found, the token is invalid or has already been used.
         if (!tokenEntry) {
           return new Response(JSON.stringify({ message: "Invalid or expired reset token." }), { status: 400, headers: { "Content-Type": "application/json" } });
         }
 
-        // Check expiry
+        // Check if the token has expired.
         if (new Date(tokenEntry.expires_at) < new Date()) {
-          // Optionally, delete expired token
+          // Delete the expired token from the database to prevent reuse.
           await env.D1_DB.prepare("DELETE FROM password_reset_tokens WHERE token_hash = ?").bind(hashedToken).run();
           return new Response(JSON.stringify({ message: "Reset token has expired." }), { status: 400, headers: { "Content-Type": "application/json" } });
         }
 
         const userEmail = tokenEntry.email;
+        // Hash the new password before updating it in the users table.
         const hashedNewPassword = await hashPassword(newPassword);
 
-        // Update user's password in the users table
+        // Update the user's password in the main users table.
         const updateResult = await env.D1_DB.prepare(
           "UPDATE users SET password_hash = ? WHERE email = ?"
         ).bind(hashedNewPassword, userEmail).run();
 
+        // Check if the update was successful.
         if (updateResult.meta.changes === 0) {
              console.error(`Failed to update password for email: ${userEmail}. User might not exist or email changed.`);
-             // This case should ideally not happen if token validation is robust
+             // This case should ideally not happen if token validation is robust and user exists.
              return new Response(JSON.stringify({ message: "Failed to update password. User not found." }), { status: 404, headers: { "Content-Type": "application/json" } });
         }
 
-        // Delete the used token from D1
+        // After successfully updating the password, delete the used token from the database.
         await env.D1_DB.prepare("DELETE FROM password_reset_tokens WHERE token_hash = ?").bind(hashedToken).run();
 
-        // Send password change confirmation email
+        // Send a confirmation email to the user that their password has been changed.
         const subject = "Your Password Has Been Reset";
         const htmlBody = `
           <h1>Password Successfully Reset</h1>
@@ -364,9 +370,9 @@ export default {
         `;
 
         console.log(`Attempting to send welcome email to: ${email}`);
-        // We don't want to block the registration response if email fails, so don't necessarily await this
-        // or handle its success/failure separately from the registration success response.
-        // For now, let's call it and log, but not change the response based on email success.
+        // Send welcome email asynchronously (non-blocking).
+        // The registration process should not fail or be delayed if the email sending encounters an issue.
+        // Errors in email sending are logged separately.
         sendEmail(env, {
           to: email,
           subject: welcomeSubject,
@@ -427,7 +433,8 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    // Test Email Route
+    // Route for testing email sending functionality directly.
+    // Requires MS_GRAPH_CLIENT_ID and MS_GRAPH_SENDING_USER_ID to be set in the environment.
     if (url.pathname === "/api/test-email") {
       if (!env.MS_GRAPH_CLIENT_ID || !env.MS_GRAPH_SENDING_USER_ID) {
         return new Response("MS Graph environment variables not configured for the test.", { status: 500 });

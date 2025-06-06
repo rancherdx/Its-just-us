@@ -3,29 +3,37 @@ import api from "../services/api"; // Assuming this path is correct based on Log
 // We might not need useNavigate for this page if we just show a message.
 // import { useNavigate } from "react-router-dom";
 
+/**
+ * ForgotPassword component.
+ * This page allows users to enter their email address to request a password reset link.
+ * It communicates with the backend API to initiate the password reset process.
+ */
 function ForgotPassword() {
   const [email, setEmail] = useState("");
-  const [message, setMessage] = useState(""); // For displaying success/error messages
+  const [message, setMessage] = useState(""); // State to display success or error messages to the user
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    setMessage(""); // Clear previous messages
+    setMessage(""); // Clear any previous messages before a new submission
     try {
+      // Make API call to request password reset
       const response = await api.post("/api/auth/request-password-reset", { email });
-      // Backend returns: { message: "If your email is registered, you will receive a password reset link." }
+      // Backend typically returns a message like: { message: "If your email is registered, you will receive a password reset link." }
       if (response.data && response.data.message) {
-        setMessage(response.data.message);
+        setMessage(response.data.message); // Display the message from the backend
       } else {
-        // Fallback, though backend should always provide a message
+        // Fallback message if the backend response is not as expected
         setMessage("Password reset request submitted. Please check your email.");
       }
     } catch (error) {
       console.error("Forgot password request failed:", error);
+      // Handle various error response structures to provide the best possible message
       if (error.response && error.response.data && error.response.data.message) {
         setMessage(`Error: ${error.response.data.message}`);
       } else if (error.message) {
         setMessage(`Error: ${error.message}`);
       } else {
+        // Generic fallback error message
         setMessage("Failed to submit password reset request. Please try again.");
       }
     }
