@@ -76,6 +76,8 @@ async function getUser(request, env) {
   return await verifyToken(token, env.JWT_SECRET);
 }
 
+import { sendEmail } from './services/microsoftGraphService.ts';
+
 const redirectUri = "https://its-just-us.your-account.workers.dev/auth/facebook/callback";
 
 export default {
@@ -93,6 +95,15 @@ export default {
             email TEXT UNIQUE,
             password_hash TEXT,
             profile_picture TEXT
+          )
+        `).run();
+
+        await env.D1_DB.prepare(`
+          CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at DATETIME NOT NULL
           )
         `).run();
 
@@ -142,6 +153,122 @@ export default {
         });
       } catch (error) {
         return new Response(`Error: ${error.message}`, { status: 500 });
+      }
+    }
+
+    // API Route: Request Password Reset
+    if (request.method === "POST" && url.pathname === "/api/auth/request-password-reset") {
+      try {
+        const { email } = await request.json();
+        if (!email) {
+          return new Response(JSON.stringify({ message: "Email is required." }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        // Check if user exists
+        const user = await env.D1_DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+        if (!user) {
+          // Important: Do not reveal if an email exists or not for security reasons.
+          // Send a generic success message regardless.
+          console.log(`Password reset requested for non-existent email (or existing, no indication): ${email}`);
+          return new Response(JSON.stringify({ message: "If your email is registered, you will receive a password reset link." }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+
+        const plainToken = crypto.randomUUID(); // Generate a secure random token
+        const hashedToken = await hashPassword(plainToken); // Use existing hashPassword function
+
+        const expiryMinutes = 60; // Token valid for 60 minutes
+        const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000).toISOString();
+
+        // Store hashed token, associated email, and expiry in D1
+        await env.D1_DB.prepare(
+          "INSERT INTO password_reset_tokens (email, token_hash, expires_at) VALUES (?, ?, ?)"
+        ).bind(email, hashedToken, expiresAt).run();
+
+        // Send password reset email
+        // Placeholder for frontend URL - ideally from env variable
+        const frontendBaseUrl = env.FRONTEND_URL || "http://localhost:3000"; // Replace with actual env var later
+        const resetLink = `${frontendBaseUrl}/reset-password?token=${plainToken}`;
+
+        const subject = "Your Password Reset Request";
+        const htmlBody = `
+          <h1>Password Reset</h1>
+          <p>You requested a password reset. Click the link below to reset your password. This link is valid for ${expiryMinutes} minutes.</p>
+          <a href="${resetLink}">${resetLink}</a>
+          <p>If you did not request this, please ignore this email.</p>
+        `;
+
+        // Non-blocking email send
+        sendEmail(env, { to: email, subject, htmlBody })
+          .then(success => console.log(success ? `Password reset email dispatched to ${email}.` : `Failed to dispatch password reset email to ${email}.`))
+          .catch(err => console.error(`Error sending password reset email to ${email}:`, err));
+
+        return new Response(JSON.stringify({ message: "If your email is registered, you will receive a password reset link." }), { status: 200, headers: { "Content-Type": "application/json" } });
+
+      } catch (error) {
+        console.error("Error in /api/auth/request-password-reset:", error);
+        return new Response(JSON.stringify({ message: "An error occurred. Please try again." }), { status: 500, headers: { "Content-Type": "application/json" } });
+      }
+    }
+
+    // API Route: Reset Password
+    if (request.method === "POST" && url.pathname === "/api/auth/reset-password") {
+      try {
+        const { token, newPassword } = await request.json();
+        if (!token || !newPassword) {
+          return new Response(JSON.stringify({ message: "Token and new password are required." }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        const hashedToken = await hashPassword(token); // Hash the plain token from the client
+
+        // Find token in D1
+        const tokenEntry = await env.D1_DB.prepare(
+          "SELECT email, expires_at FROM password_reset_tokens WHERE token_hash = ?"
+        ).bind(hashedToken).first();
+
+        if (!tokenEntry) {
+          return new Response(JSON.stringify({ message: "Invalid or expired reset token." }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        // Check expiry
+        if (new Date(tokenEntry.expires_at) < new Date()) {
+          // Optionally, delete expired token
+          await env.D1_DB.prepare("DELETE FROM password_reset_tokens WHERE token_hash = ?").bind(hashedToken).run();
+          return new Response(JSON.stringify({ message: "Reset token has expired." }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        const userEmail = tokenEntry.email;
+        const hashedNewPassword = await hashPassword(newPassword);
+
+        // Update user's password in the users table
+        const updateResult = await env.D1_DB.prepare(
+          "UPDATE users SET password_hash = ? WHERE email = ?"
+        ).bind(hashedNewPassword, userEmail).run();
+
+        if (updateResult.meta.changes === 0) {
+             console.error(`Failed to update password for email: ${userEmail}. User might not exist or email changed.`);
+             // This case should ideally not happen if token validation is robust
+             return new Response(JSON.stringify({ message: "Failed to update password. User not found." }), { status: 404, headers: { "Content-Type": "application/json" } });
+        }
+
+        // Delete the used token from D1
+        await env.D1_DB.prepare("DELETE FROM password_reset_tokens WHERE token_hash = ?").bind(hashedToken).run();
+
+        // Send password change confirmation email
+        const subject = "Your Password Has Been Reset";
+        const htmlBody = `
+          <h1>Password Successfully Reset</h1>
+          <p>Your password for It's Just Us has been successfully reset.</p>
+          <p>If you did not make this change, please contact support immediately.</p>
+        `;
+        sendEmail(env, { to: userEmail, subject, htmlBody })
+          .then(success => console.log(success ? `Password change confirmation email dispatched to ${userEmail}.` : `Failed to dispatch password change confirmation to ${userEmail}.`))
+          .catch(err => console.error(`Error sending password change confirmation to ${userEmail}:`, err));
+
+        return new Response(JSON.stringify({ message: "Password reset successfully." }), { status: 200, headers: { "Content-Type": "application/json" } });
+
+      } catch (error) {
+        console.error("Error in /api/auth/reset-password:", error);
+        return new Response(JSON.stringify({ message: "An error occurred. Please try again." }), { status: 500, headers: { "Content-Type": "application/json" } });
       }
     }
 
@@ -212,12 +339,68 @@ export default {
 
     // Email/Password Register
     if (request.method === "POST" && url.pathname === "/auth/register") {
-      const { name, email, password } = await request.json();
-      const hashedPassword = await hashPassword(password);
-      await env.D1_DB.prepare(
-        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)"
-      ).bind(name, email, hashedPassword).run();
-      return new Response("User registered", { status: 201 });
+      try {
+        const { name, email, password } = await request.json();
+        if (!name || !email || !password) {
+          return new Response(JSON.stringify({ message: "Missing name, email, or password" }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        const hashedPassword = await hashPassword(password);
+
+        // Insert user into database
+        await env.D1_DB.prepare(
+          "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)"
+        ).bind(name, email, hashedPassword).run();
+
+        // Send welcome email
+        const welcomeSubject = `Welcome to It's Just Us, ${name}!`;
+        const welcomeHtmlBody = `
+          <h1>Welcome, ${name}!</h1>
+          <p>Thank you for registering at It's Just Us.</p>
+          <p>We're excited to have you join our community!</p>
+          <br>
+          <p>Best regards,</p>
+          <p>The It's Just Us Team</p>
+        `;
+
+        console.log(`Attempting to send welcome email to: ${email}`);
+        // We don't want to block the registration response if email fails, so don't necessarily await this
+        // or handle its success/failure separately from the registration success response.
+        // For now, let's call it and log, but not change the response based on email success.
+        sendEmail(env, {
+          to: email,
+          subject: welcomeSubject,
+          htmlBody: welcomeHtmlBody
+        }).then(success => {
+          if (success) {
+            console.log(`Welcome email successfully dispatched to ${email}.`);
+          } else {
+            console.error(`Failed to dispatch welcome email to ${email}.`);
+          }
+        }).catch(error => {
+          console.error(`Error sending welcome email to ${email}:`, error);
+        });
+
+        return new Response(JSON.stringify({ message: "User registered successfully. A welcome email is being sent." }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" }
+        });
+
+      } catch (dbError) {
+        // Check for unique constraint error for email
+        if (dbError.message && dbError.message.includes("UNIQUE constraint failed: users.email")) {
+          console.error("Registration failed: Email already exists.", dbError);
+          return new Response(JSON.stringify({ message: "Email already exists. Please use a different email or login." }), {
+            status: 409, // Conflict
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        console.error("Error during registration:", dbError);
+        return new Response(JSON.stringify({ message: "Error during registration.", error: dbError.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
     }
 
     // Email/Password Login
@@ -242,6 +425,43 @@ export default {
     // Protect API routes
     if (!user && !["/test", "/auth/facebook", "/auth/facebook/callback", "/auth/facebook/token", "/auth/register", "/auth/login", "/auth/logout"].includes(url.pathname)) {
       return new Response("Unauthorized", { status: 401 });
+    }
+
+    // Test Email Route
+    if (url.pathname === "/api/test-email") {
+      if (!env.MS_GRAPH_CLIENT_ID || !env.MS_GRAPH_SENDING_USER_ID) {
+        return new Response("MS Graph environment variables not configured for the test.", { status: 500 });
+      }
+      try {
+        // IMPORTANT: Replace with a real email address you can check when testing
+        const testEmailRecipient = "test-recipient@example.com";
+
+        console.log(`Attempting to send test email to ${testEmailRecipient} via /api/test-email route.`);
+
+        const success = await sendEmail(env, {
+          to: testEmailRecipient,
+          subject: "Test Email from Cloudflare Worker (MS Graph)",
+          htmlBody: "<h1>Hello from the Test Route!</h1><p>This is a test email sent using the Microsoft Graph API service from your Cloudflare Worker.</p><p>If you received this, the service is working, but please ensure your secrets are correctly configured in the Cloudflare dashboard (MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_SENDING_USER_ID).</p>"
+        });
+
+        if (success) {
+          return new Response(JSON.stringify({ message: `Test email sent successfully to ${testEmailRecipient}. Check the inbox.` }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200
+          });
+        } else {
+          return new Response(JSON.stringify({ message: "Failed to send test email. Check worker logs for details." }), {
+            headers: { "Content-Type": "application/json" },
+            status: 500
+          });
+        }
+      } catch (error) {
+        console.error("Error in /api/test-email route:", error);
+        return new Response(JSON.stringify({ message: "Error processing test email request.", error: error.message }), {
+          headers: { "Content-Type": "application/json" },
+          status: 500
+        });
+      }
     }
 
     return new Response("Page not found", { status: 404 });
