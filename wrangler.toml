@@ -8,10 +8,12 @@ assets = { directory = "./public" }
 binding = "D1_DB"                     # Reference name in your Worker code
 database_name = "its-just-us"         # The actual database name
 database_id = "f2c6a39c-935d-4720-8367-5a2ea6b975d5"  # Your D1 database ID
+migrations = true # Ensure this line is present or added
 
-[[migrations]]
-tag = "v1"
-new_classes = ["MyDurableObject"]
+[migrations]
+dir = "./migrations" # Specifies the directory for all migrations (D1 .sql files, DO new_classes)
+tag = "v1_schema_init" # A descriptive tag for this migration set
+new_classes = ["MyDurableObject"] # Include this line if MyDurableObject is a Durable Object still managed by migrations. Remove or comment out if not.
 
 [durable_objects]
 bindings = [
