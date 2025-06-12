@@ -9,6 +9,24 @@ class MyDurableObject {
   }
 }
 
+// Audit Log Helper
+async function logAuditEvent(env, request, action, userId, targetType, targetId, outcome = "success", logDetails = {}) {
+  try {
+    const ipAddress = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || "unknown";
+    const userAgent = request.headers.get('User-Agent') || "unknown";
+    // Ensure logDetails is an object before spreading
+    const detailsToStore = typeof logDetails === 'object' && logDetails !== null ? logDetails : {};
+    const fullDetails = JSON.stringify({ outcome, ...detailsToStore });
+
+    await env.D1_DB.prepare(
+      "INSERT INTO audit_logs (user_id, action, target_type, target_id, ip_address, user_agent, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(userId, action, targetType, targetId, ipAddress, userAgent, fullDetails).run();
+  } catch (dbError) {
+    console.error(`Failed to log audit event ${action} for user ${userId}:`, dbError.message, dbError.cause);
+  }
+}
+
+
 async function sendPushNotification(subscription, payloadString, env) {
   // IMPORTANT: Full VAPID header generation is complex and typically uses a library.
   // This is a simplified placeholder to show the flow.
@@ -486,8 +504,14 @@ function errorResponse(message, status = 400) {
 }
 
 // JWT Helper Functions
-async function signToken(payload, secret) {
+async function signToken(rawPayload, secret) { // Renamed payload to rawPayload to avoid confusion
   const header = { alg: "HS256", typ: "JWT" };
+  // Add jti and ensure exp is set (e.g., 1 hour from now)
+  const payload = {
+    ...rawPayload,
+    jti: crypto.randomUUID(),
+    exp: rawPayload.exp || Math.floor(Date.now() / 1000) + (60 * 60) // Default 1 hour
+  };
   const encodedHeader = btoa(JSON.stringify(header)).replace(/=+$/, "");
   const encodedPayload = btoa(JSON.stringify(payload)).replace(/=+$/, "");
   const signatureInput = `${encodedHeader}.${encodedPayload}`;
@@ -510,32 +534,60 @@ async function signToken(payload, secret) {
   return `${signatureInput}.${encodedSignature}`;
 }
 
-async function verifyToken(token, secret) {
-  const [header, payload, signature] = token.split(".");
-  const signatureInput = `${header}.${payload}`;
-  
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"]
-  );
-  const expectedSignature = new Uint8Array(
-    atob(signature)
-      .split("")
-      .map(c => c.charCodeAt(0))
-  );
-  const isValid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    expectedSignature,
-    encoder.encode(signatureInput)
-  );
-  
-  if (!isValid) return null;
-  return JSON.parse(atob(payload));
+async function verifyToken(token, secret, env) { // Added env for D1 access
+  try {
+    const [header, payloadB64, signatureB64] = token.split(".");
+    if (!header || !payloadB64 || !signatureB64) {
+      console.log("Token structure invalid");
+      return null;
+    }
+
+    const signatureInput = `${header}.${payloadB64}`;
+    const decodedPayload = JSON.parse(atob(payloadB64));
+
+    // Check blocklist first
+    if (decodedPayload.jti) {
+      const blocklisted = await env.D1_DB.prepare("SELECT 1 FROM jwt_blocklist WHERE jti = ?").bind(decodedPayload.jti).first();
+      if (blocklisted) {
+        console.log(`Token JTI ${decodedPayload.jti} is blocklisted.`);
+        return null;
+      }
+    }
+
+    // Check expiration
+    if (decodedPayload.exp && Math.floor(Date.now() / 1000) > decodedPayload.exp) {
+      console.log(`Token expired at ${new Date(decodedPayload.exp * 1000)}`);
+      // Optionally, clean up this specific JTI if it's also in blocklist due to logout (though it's expired anyway)
+      // await env.D1_DB.prepare("DELETE FROM jwt_blocklist WHERE jti = ?").bind(decodedPayload.jti).run();
+      return null;
+    }
+
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+    const signature = Uint8Array.from(atob(signatureB64.replace(/_/g, '/').replace(/-/g, '+')), c => c.charCodeAt(0));
+
+    const isValid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      signature,
+      encoder.encode(signatureInput)
+    );
+
+    if (!isValid) {
+      console.log("Token signature invalid");
+      return null;
+    }
+    return decodedPayload;
+  } catch (error) {
+    console.error("Error verifying token:", error);
+    return null;
+  }
 }
 
 async function hashPassword(password) {
@@ -545,11 +597,12 @@ async function hashPassword(password) {
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function getUser(request, env) {
+async function getUser(request, env) { // env already passed
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
   const token = authHeader.split(" ")[1];
-  return await verifyToken(token, env.JWT_SECRET);
+  // Pass env to verifyToken
+  return await verifyToken(token, env.JWT_SECRET, env);
 }
 
 import { sendEmail } from './services/microsoftGraphService.ts';
@@ -1079,21 +1132,107 @@ export default {
 
     // Email/Password Login
     if (request.method === "POST" && url.pathname === "/auth/login") {
-      const { email, password } = await request.json();
+      const requestData = await request.json(); // Store request data for potential use in logging
+      const { email, password } = requestData;
       const hashedPassword = await hashPassword(password);
-      const user = await env.D1_DB.prepare(
-        "SELECT id, email FROM users WHERE email = ? AND password_hash = ?"
+      const dbUser = await env.D1_DB.prepare(
+        "SELECT id, email, name, profile_picture FROM users WHERE email = ? AND password_hash = ?"
       ).bind(email, hashedPassword).first();
-      if (!user) return new Response("Invalid credentials", { status: 401 });
-      const token = await signToken({ userId: user.id, email, exp: Math.floor(Date.now() / 1000) + 3600 }, env.JWT_SECRET);
-      return new Response(JSON.stringify({ token }), {
-        headers: { "Content-Type": "application/json" },
-      });
+
+      const ipAddress = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || "unknown";
+      const userAgent = request.headers.get('User-Agent') || "unknown";
+
+      if (!dbUser) {
+        await logAuditEvent(env, request, 'login_failed', null, 'user', email, 'failure', { reason: 'Invalid credentials' });
+        // Log failed login attempt
+        try {
+            await env.D1_DB.prepare(
+                "INSERT INTO failed_login_attempts (attempted_identifier, ip_address, user_agent) VALUES (?, ?, ?)"
+            ).bind(email, ipAddress, userAgent).run();
+        } catch (failedLoginError) {
+            console.error("Error logging failed login attempt:", failedLoginError);
+        }
+        return errorResponse("Invalid credentials", 401);
+      }
+
+      // Log successful login
+      await logAuditEvent(env, request, 'login', dbUser.id, 'user', dbUser.id, 'success');
+
+      // Record/Update known IP for the user
+      try {
+        const now = new Date().toISOString();
+        const existingIp = await env.D1_DB.prepare(
+          "SELECT id FROM user_known_ips WHERE user_id = ? AND ip_address = ?"
+        ).bind(dbUser.id, ipAddress).first();
+
+        if (existingIp) {
+          await env.D1_DB.prepare(
+            "UPDATE user_known_ips SET last_seen_at = ? WHERE id = ?"
+          ).bind(now, existingIp.id).run();
+        } else {
+          await env.D1_DB.prepare(
+            "INSERT INTO user_known_ips (user_id, ip_address, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)"
+          ).bind(dbUser.id, ipAddress, now, now).run();
+        }
+      } catch (ipTrackingError) {
+          console.error("Error tracking user IP:", ipTrackingError);
+          // Non-critical error, so login can proceed
+      }
+
+      // Payload for signToken should ideally include only necessary, non-sensitive info for the client/session
+      const tokenPayload = {
+        userId: dbUser.id,
+        email: dbUser.email,
+        name: dbUser.name, // Optional: include name if useful in client-side user object
+        profile_picture: dbUser.profile_picture, // Optional
+        // exp is now handled by signToken by default
+      };
+      const token = await signToken(tokenPayload, env.JWT_SECRET);
+
+      return jsonResponse({ token, user: {id: dbUser.id, name: dbUser.name, email: dbUser.email, profile_picture: dbUser.profile_picture }});
     }
 
-    // Logout (client-side)
-    if (url.pathname === "/auth/logout") {
-      return new Response("Logout successful (discard token client-side)", { status: 200 });
+    // Logout - Now requires token to blocklist
+    if (url.pathname === "/auth/logout" && request.method === "POST") { // Changed to POST for clarity, though GET could work
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return errorResponse("No token provided for logout.", 400);
+      }
+      const token = authHeader.split(" ")[1];
+
+      // We don't strictly need to verify the signature for logout blocklisting,
+      // but decoding is needed to get jti and exp.
+      // A lightweight decode might be better if performance is critical.
+      // For simplicity, using verifyToken which also checks expiry but not blocklist yet for itself.
+      const decodedPayload = await verifyToken(token, env.JWT_SECRET, env); // verifyToken now checks blocklist
+                                                                           // so if it's already blocklisted, this would return null.
+                                                                           // This is okay, means it's already dealt with.
+
+      if (decodedPayload && decodedPayload.jti && decodedPayload.exp) {
+        const expiresAtISO = new Date(decodedPayload.exp * 1000).toISOString();
+        try {
+          await env.D1_DB.prepare(
+            "INSERT INTO jwt_blocklist (jti, user_id, expires_at) VALUES (?, ?, ?)"
+          ).bind(decodedPayload.jti, decodedPayload.userId, expiresAtISO).run();
+          await logAuditEvent(env, request, 'logout', decodedPayload.userId, 'jwt', decodedPayload.jti, 'success');
+          return jsonResponse({ message: "Logout successful. Token blocklisted." });
+        } catch (dbError) {
+          // Handle potential unique constraint violation if jti somehow already exists (e.g. race condition or re-logout)
+          if (dbError.message.includes("UNIQUE constraint failed")) {
+             await logAuditEvent(env, request, 'logout_ignored', decodedPayload.userId, 'jwt', decodedPayload.jti, 'ignored', {reason: "Token already blocklisted"});
+            return jsonResponse({ message: "Token already blocklisted or logout processed." });
+          }
+          console.error("Error blocklisting token:", dbError);
+          await logAuditEvent(env, request, 'logout_failed', decodedPayload.userId, 'jwt', decodedPayload.jti, 'failure', {reason: "DB error"});
+          return errorResponse("Failed to blocklist token.", 500);
+        }
+      } else {
+        // If token is invalid (e.g. expired, bad signature, or already blocklisted and verifyToken returned null)
+        // Still log an attempt if possible, though userId might be unknown
+        const attemptedJti = token.split('.')[1] ? JSON.parse(atob(token.split('.')[1])).jti : "unknown_jti";
+        await logAuditEvent(env, request, 'logout_failed', null, 'jwt', attemptedJti, 'failure', {reason: "Invalid or missing token for logout"});
+        return errorResponse("Invalid or missing token for logout.", 400);
+      }
     }
 
     // Messaging API Endpoints
