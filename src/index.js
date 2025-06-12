@@ -9,6 +9,405 @@ class MyDurableObject {
   }
 }
 
+async function sendPushNotification(subscription, payloadString, env) {
+  // IMPORTANT: Full VAPID header generation is complex and typically uses a library.
+  // This is a simplified placeholder to show the flow.
+  // A proper implementation would involve JWT creation and ES256 signing.
+
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) {
+    console.error("VAPID keys not configured. Cannot send push notification.");
+    return false;
+  }
+
+  // const pushServiceOrigin = new URL(subscription.endpoint).origin; // Not used in simulation
+
+  // Simplified VAPID headers (conceptual)
+  // Real headers include 'Authorization: VAPID t=<jwt>, k=<public_key_base64url>'
+  // and 'Encryption: salt=<salt_bytes_base64url>'
+  // and 'Crypto-Key: dh=<public_key_bytes_base64url>;p256ecdsa=<public_key_bytes_base64url>'
+  // The body itself also needs to be encrypted using Web Push Encryption.
+
+  console.log(`Simulating push notification to: ${subscription.endpoint}`);
+  console.log(`Payload: ${payloadString}`);
+  console.log(`(Would use VAPID keys here and encrypt payload for real push)`);
+
+  try {
+    // const response = await fetch(subscription.endpoint, {
+    //   method: "POST",
+    //   headers: {
+    //     // ... complex VAPID and encryption headers ...
+    //     'Content-Type': 'application/octet-stream', // If encrypted
+    //     'TTL': '86400' // Time to live in seconds
+    //   },
+    //   body: encryptedPayload // Encrypted payload
+    // });
+
+    // Simulate response handling
+    // if (response.status === 410 || response.status === 404) { // Gone or Not Found - subscription expired or invalid
+    //   console.log(`Subscription ${subscription.endpoint} is gone/invalid. Deleting.`);
+    //   // Ensure subscription.user_id is available if this logic is enabled
+    //   // await env.D1_DB.prepare("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?")
+    //   //   .bind(subscription.user_id, subscription.endpoint)
+    //   //   .run();
+    //   return false;
+    // }
+    // if (!response.ok) {
+    //   console.error(`Push service error for ${subscription.endpoint}: ${response.status}`);
+    //   return false;
+    // }
+    // console.log(`Push notification sent successfully to ${subscription.endpoint}`);
+    return true; // Simulated success
+  } catch (error) {
+    console.error(`Error sending push notification to ${subscription.endpoint}:`, error);
+    return false;
+  }
+}
+
+export class VideoCallSignalingDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.videoCallId = state.id.toString();
+    this.participants = new Map(); // userId -> WebSocket
+    this.userIdToSessionId = new Map(); // userId -> sessionId
+    this.sessions = new Map(); // sessionId -> WebSocket
+    // console.log(`VideoCallSignalingDO created for call: ${this.videoCallId}`);
+  }
+
+  generateSessionId() {
+    return crypto.randomUUID();
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.headers.get("Upgrade") === "websocket") {
+      const userId = request.headers.get("X-User-Id");
+      if (!userId) {
+        return errorResponse("X-User-Id header is required for WebSocket connection.", 400);
+      }
+
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      await this.state.acceptWebSocket(server);
+
+      const sessionId = this.generateSessionId();
+      server.sessionInfo = { userId, sessionId, videoCallId: this.videoCallId };
+
+      // If user already has a session, clean it up before starting a new one.
+      if (this.userIdToSessionId.has(userId)) {
+          const oldSessionId = this.userIdToSessionId.get(userId);
+          const oldWs = this.sessions.get(oldSessionId);
+          if (oldWs) {
+              // console.log(`User ${userId} reconnecting, closing old WebSocket session ${oldSessionId}`);
+              oldWs.close(1000, "Reconnecting with new session");
+              this.sessions.delete(oldSessionId);
+          }
+      }
+
+      this.sessions.set(sessionId, server);
+      this.participants.set(userId, server);
+      this.userIdToSessionId.set(userId, sessionId);
+
+      // console.log(`User ${userId} (Session: ${sessionId}) connected to VideoCallSignalingDO: ${this.videoCallId}. Total sessions: ${this.sessions.size}`);
+
+      // Notify other participants
+      const joinNotification = JSON.stringify({ type: "user-joined", userId: userId, videoCallId: this.videoCallId });
+      this.broadcast(joinNotification, sessionId);
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    return errorResponse("Expected WebSocket upgrade request.", 400);
+  }
+
+  async webSocketMessage(ws, message) {
+    const senderUserId = ws.sessionInfo.userId;
+    // console.log(`Message from ${senderUserId} in ${this.videoCallId}: ${message}`);
+
+    let parsedMessage;
+    try {
+        parsedMessage = JSON.parse(message);
+    } catch (e) {
+        console.error(`Failed to parse message from ${senderUserId}: ${message}`);
+        ws.send(JSON.stringify({type: "error", payload: {message: "Invalid JSON message format."}}));
+        return;
+    }
+
+    const targetUserId = parsedMessage.targetUserId;
+
+    if (targetUserId) {
+      const targetWs = this.participants.get(targetUserId);
+      if (targetWs && targetWs.readyState === WebSocket.READY_STATE_OPEN) {
+        // console.log(`Forwarding message from ${senderUserId} to ${targetUserId}`);
+        // Add senderId to the message if not already present, so target knows who it's from
+        if (!parsedMessage.senderUserId) {
+            parsedMessage.senderUserId = senderUserId;
+        }
+        targetWs.send(JSON.stringify(parsedMessage));
+      } else {
+        // console.warn(`Target user ${targetUserId} not found or WebSocket not open for message from ${senderUserId}.`);
+        // Optionally notify sender that target is not available
+         ws.send(JSON.stringify({type: "error", payload: {message: `User ${targetUserId} is not available.`}}));
+      }
+    } else {
+      // Broadcast to all OTHER participants if no specific target
+      // console.log(`Broadcasting message from ${senderUserId} to others in ${this.videoCallId}`);
+       if (!parsedMessage.senderUserId) {
+            parsedMessage.senderUserId = senderUserId;
+        }
+      this.participants.forEach((participantWs, userId) => {
+        if (userId !== senderUserId && participantWs.readyState === WebSocket.READY_STATE_OPEN) {
+          try {
+            participantWs.send(JSON.stringify(parsedMessage));
+          } catch (e) {
+            console.error(`Error broadcasting to ${userId}: ${e.message}`);
+          }
+        }
+      });
+    }
+  }
+
+  async webSocketClose(ws, code, reason, wasClean) {
+    const { userId, sessionId, videoCallId } = ws.sessionInfo;
+    // console.log(`WebSocket closed for user ${userId} (Session: ${sessionId}) in call ${videoCallId}. Code: ${code}, Reason: ${reason}, Clean: ${wasClean}.`);
+
+    this.sessions.delete(sessionId);
+    // Only delete from participants map if this specific session was the one mapped
+    if (this.userIdToSessionId.get(userId) === sessionId) {
+        this.participants.delete(userId);
+        this.userIdToSessionId.delete(userId);
+        // Notify other participants
+        const leftNotification = JSON.stringify({ type: "user-left", userId: userId, videoCallId: this.videoCallId });
+        this.broadcast(leftNotification, sessionId); // Exclude the leaving session from this broadcast
+    }
+    // console.log(`User ${userId} removed. Participants remaining: ${this.participants.size}, Sessions: ${this.sessions.size}`);
+  }
+
+  async webSocketError(ws, error) {
+    const { userId, sessionId, videoCallId } = ws.sessionInfo || { userId: 'unknown', sessionId: 'unknown', videoCallId: this.videoCallId };
+    console.error(`WebSocket error for user ${userId} (Session: ${sessionId}) in call ${videoCallId}: ${error.message}`, error.stack);
+    // Trigger cleanup, ensuring it's safe even if ws.sessionInfo is partially lost
+    if (ws.sessionInfo) {
+        await this.webSocketClose(ws, 1011, "WebSocket error", false);
+    }
+  }
+
+  broadcast(messageString, excludeSessionId) {
+    // console.log(`Broadcasting in DO ${this.videoCallId} (excluding ${excludeSessionId}): ${messageString}`);
+    this.sessions.forEach((sessionWs) => {
+      if (sessionWs.sessionInfo.sessionId !== excludeSessionId && sessionWs.readyState === WebSocket.READY_STATE_OPEN) {
+        try {
+          sessionWs.send(messageString);
+        } catch (e) {
+          console.error(`Error sending to session ${sessionWs.sessionInfo.sessionId}: ${e.message}`);
+        }
+      }
+    });
+  }
+}
+
+export class ConversationDurableObject {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.sessions = new Map(); // Map unique ID to WebSocket object
+    this.conversationId = state.id.toString(); // DO is named with conversationId
+    // Initialize D1 access if needed within other methods if env.D1_DB is correctly passed
+    this.D1_DB = env.D1_DB;
+  }
+
+  // Helper to generate a unique ID for sessions
+  generateSessionId() {
+    return crypto.randomUUID();
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    // Handle WebSocket upgrade requests
+    if (request.headers.get("Upgrade") === "websocket") {
+      if (!request.headers.get("X-User-Id")) {
+        return new Response("User ID required for WebSocket connection", { status: 400 });
+      }
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+
+      await this.state.acceptWebSocket(server);
+      const sessionId = this.generateSessionId();
+      server.sessionInfo = {
+        userId: request.headers.get("X-User-Id"), // Get senderId from header
+        sessionId: sessionId
+      };
+      this.sessions.set(sessionId, server);
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // Handle internal broadcast triggers from the main worker
+    // Example path: /internal/do/:conversationId/broadcast (though path on DO itself is just /broadcast-message)
+    if (url.pathname === "/broadcast-message" && request.method === "POST") {
+      try {
+        const message = await request.json();
+        // Assuming message is already fully formed (including sender details if fetched by main worker)
+        this.broadcast(JSON.stringify(message), null); // null senderWs as it's from API
+        return new Response("Message broadcasted", { status: 200 });
+      } catch (error) {
+        console.error("DO Broadcast Error:", error);
+        return new Response("Error broadcasting message: " + error.message, { status: 500 });
+      }
+    }
+
+    return new Response("Not found in DO", { status: 404 });
+  }
+
+  async webSocketMessage(ws, message) {
+    try {
+      const parsedMessage = JSON.parse(message);
+      const senderId = ws.sessionInfo.userId;
+      const conversationId = this.conversationId;
+      const now = new Date().toISOString();
+
+      // Basic validation
+      if (!parsedMessage.content || parsedMessage.content.trim() === "") {
+        ws.send(JSON.stringify({ error: "Message content cannot be empty."}));
+        return;
+      }
+
+      const messageId = crypto.randomUUID();
+
+      const persistedMessage = {
+        id: messageId,
+        conversation_id: conversationId,
+        sender_id: senderId,
+        content: parsedMessage.content,
+        message_type: parsedMessage.message_type || 'text',
+        media_url: parsedMessage.media_url || null,
+        reactions_json: null, // Default or handle later
+        parent_message_id: null, // Default or handle later
+        is_edited: 0,
+        is_deleted: 0,
+        created_at: now,
+        updated_at: now,
+        // You might want to fetch sender's name/profile_picture here or expect it from client
+        // For simplicity, client can use sender_id to look up user details
+        sender: { id: senderId } // Minimal sender info for broadcast
+      };
+
+      // Persist to D1 - Ensure D1_DB is available (passed in env)
+      const msgInsertResult = await this.D1_DB.prepare(
+        "INSERT INTO messages (id, conversation_id, sender_id, content, message_type, media_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(
+        persistedMessage.id,
+        persistedMessage.conversation_id,
+        persistedMessage.sender_id,
+        persistedMessage.content,
+        persistedMessage.message_type,
+        persistedMessage.media_url,
+        persistedMessage.created_at,
+        persistedMessage.updated_at
+      ).run();
+
+      // Update conversation's last_message_at and updated_at
+      const convUpdateResult = await this.D1_DB.prepare(
+        "UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ?"
+      ).bind(now, now, conversationId).run();
+
+      this.broadcast(JSON.stringify(persistedMessage), ws);
+
+      // After broadcasting, send push notifications (non-blocking in DO context)
+      if (msgInsertResult.success && convUpdateResult.success) {
+        this.state.waitUntil((async () => {
+          try {
+            const participantsResult = await this.D1_DB.prepare(
+              "SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ?"
+            ).bind(conversationId, senderId).all();
+
+            if (participantsResult.results && participantsResult.results.length > 0) {
+              // Attempt to get sender's name for a richer notification
+              let senderName = "Someone"; // Default sender name
+              try {
+                const senderInfo = await this.D1_DB.prepare("SELECT name FROM users WHERE id = ?").bind(senderId).first();
+                if (senderInfo && senderInfo.name) {
+                  senderName = senderInfo.name;
+                }
+              } catch (nameError) {
+                console.error(`DO: Error fetching sender name for push notification (senderId: ${senderId}): ${nameError.message}`);
+              }
+
+              for (const participant of participantsResult.results) {
+                const subscriptionsResult = await this.D1_DB.prepare(
+                  "SELECT endpoint, keys_p256dh, keys_auth, user_id FROM push_subscriptions WHERE user_id = ?"
+                ).bind(participant.user_id).all();
+
+                if (subscriptionsResult.results) {
+                  for (const sub of subscriptionsResult.results) {
+                    const payload = JSON.stringify({
+                      title: "New Message",
+                      body: `${senderName}: ${persistedMessage.content.substring(0, 50)}${persistedMessage.content.length > 50 ? '...' : ''}`,
+                      data: { conversationId: conversationId, messageId: persistedMessage.id }
+                    });
+                    // Not using ctx.waitUntil here as this.state.waitUntil is the DO equivalent
+                    await sendPushNotification(sub, payload, this.env);
+                  }
+                }
+              }
+            }
+          } catch (pushError) {
+            console.error(`DO Push Notification Error (ConvID: ${this.conversationId}): ${pushError.message}`, pushError.stack);
+          }
+        })());
+      }
+
+    } catch (error) {
+      console.error(`DO WebSocketMessage Error (ConvID: ${this.conversationId}, UserID: ${ws.sessionInfo?.userId}): ${error.message}`, error.stack);
+      try {
+        ws.send(JSON.stringify({ error: "Failed to process message: " + error.message }));
+      } catch (sendError) {
+        console.error("DO Error sending error to WebSocket:", sendError);
+      }
+    }
+  }
+
+  async webSocketClose(ws, code, reason, wasClean) {
+    console.log(`WebSocket closed (ConvID: ${this.conversationId}, UserID: ${ws.sessionInfo?.userId}, SessionID: ${ws.sessionInfo?.sessionId}) code: ${code}, reason: ${reason}, wasClean: ${wasClean}`);
+    if (ws.sessionInfo) {
+      this.sessions.delete(ws.sessionInfo.sessionId);
+    }
+  }
+
+  async webSocketError(ws, error) {
+    console.error(`WebSocket Error (ConvID: ${this.conversationId}, UserID: ${ws.sessionInfo?.userId}, SessionID: ${ws.sessionInfo?.sessionId}): ${error.message}`, error.stack);
+    if (ws.sessionInfo) {
+      this.sessions.delete(ws.sessionInfo.sessionId);
+    }
+  }
+
+  broadcast(messageString, senderWs) {
+    // console.log(`Broadcasting from DO (ConvID: ${this.conversationId}): ${messageString}`);
+    this.sessions.forEach((socket, sessionId) => {
+      // Cloudflare Workers DO WebSockets don't have a senderWs === socket comparison that works directly with the object reference from webSocketMessage
+      // If senderWs is provided, we assume its sessionInfo.sessionId matches the key in this.sessions
+      if (senderWs && senderWs.sessionInfo && senderWs.sessionInfo.sessionId === sessionId) {
+         // Don't send back to the original sender of this specific message if it came from a WebSocket.
+         // If senderWs is null (e.g. broadcast from API), send to all.
+         return;
+      }
+      if (socket.readyState === WebSocket.READY_STATE_OPEN) { // Native WebSocket constant
+        try {
+          socket.send(messageString);
+        } catch (e) {
+          console.error(`Broadcast send error to session ${sessionId} in ConvID ${this.conversationId}: ${e.message}`);
+          // Optionally remove unresponsive/erroring sessions
+          // this.sessions.delete(sessionId);
+        }
+      } else {
+        // Optional: Clean up sessions that are not open
+        // console.log(`Session ${sessionId} in ConvID ${this.conversationId} not open, removing.`);
+        // this.sessions.delete(sessionId);
+      }
+    });
+  }
+}
+
 // Encryption Helper Functions
 async function getKey(env) {
   if (!env.ENCRYPTION_KEY) {
@@ -198,24 +597,77 @@ export default {
     if (url.pathname === "/api/video/calls" && request.method === "POST") {
       if (!user) return errorResponse("Unauthorized", 401);
       try {
-        const body = await request.json().catch(() => ({})); // Allow empty body for default title/participants
+        const body = await request.json().catch(() => ({}));
         const { title, max_participants } = body;
         const creatorId = user.userId;
 
         const callId = crypto.randomUUID();
-        const roomName = crypto.randomUUID(); // Simple unique room name
+        const roomName = crypto.randomUUID();
         const now = new Date().toISOString();
-        const callStatus = 'pending'; // Initial status
+        const callStatus = 'pending';
 
+        // Initial insert into video_calls
         await env.D1_DB.prepare(
           "INSERT INTO video_calls (id, room_name, created_by_user_id, title, start_time, status, max_participants, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(callId, roomName, creatorId, title || `Call by ${user.name || creatorId}`, now, callStatus, max_participants || null, now, now).run();
-        // Note: user.name might not be in JWT. If not, a default title or fetching user name would be better.
 
         // Add creator as participant
         await env.D1_DB.prepare(
           "INSERT INTO call_participants (call_id, user_id, status) VALUES (?, ?, ?)"
         ).bind(callId, creatorId, 'host').run();
+
+        // Fetch Cloudflare Calls Credentials
+        const cfCallsIntegration = await env.D1_DB.prepare(
+            "SELECT client_id_encrypted, api_key_encrypted FROM third_party_integrations WHERE service_name = 'CloudflareCalls' AND is_enabled = 1"
+        ).first();
+
+        if (!cfCallsIntegration) {
+            // Potentially delete the local video_calls record or mark it as failed
+            // For now, let it exist but client won't get CF details
+            console.warn(`Cloudflare Calls integration not configured or disabled for call ${callId}.`);
+        }
+
+        let decryptedAppId = null;
+        let decryptedApiToken = null;
+        let cfSessionData = null;
+        let clientTokenForUser = null;
+
+        if (cfCallsIntegration) {
+            try {
+                decryptedAppId = await decrypt(cfCallsIntegration.client_id_encrypted, env); // Assuming client_id stores App ID
+                decryptedApiToken = await decrypt(cfCallsIntegration.api_key_encrypted, env); // Assuming api_key stores API Token
+            } catch (decryptionError) {
+                console.error("Failed to decrypt Cloudflare Calls credentials:", decryptionError);
+                // Proceed without CF Calls integration if decryption fails
+            }
+        }
+
+        if (decryptedAppId && decryptedApiToken) {
+            try {
+                // For this subtask, we simulate a successful Cloudflare Calls API response:
+                cfSessionData = {
+                    id: `sim_cf_sess_${crypto.randomUUID()}`, // Simulated session ID from CF
+                    // Example structure, might include a specific token for clients to join this session
+                    // This token is often different from the API token used for server-to-server auth.
+                    // Let's assume CF returns a "sessionJoinToken" or similar for clients.
+                    // For the purpose of this task, we'll call it 'token_for_client' to match the prompt
+                    token_for_client: `sim_client_token_for_call_${callId}_${crypto.randomUUID()}`
+                };
+                console.log("Simulated Cloudflare Calls session creation:", cfSessionData);
+
+                // Update video_calls record with CF Calls info
+                await env.D1_DB.prepare(
+                    "UPDATE video_calls SET cf_calls_app_id = ?, cf_calls_session_id = ?, cf_calls_data = ?, updated_at = ? WHERE id = ?"
+                ).bind(decryptedAppId, cfSessionData.id, JSON.stringify(cfSessionData), new Date().toISOString(), callId).run();
+
+                clientTokenForUser = cfSessionData.token_for_client;
+
+            } catch (error) {
+                console.error("Failed to create/process Cloudflare Calls session:", error);
+                // Potentially delete the local video_calls record or mark it as failed if CF Calls session is critical
+                // For now, we proceed, and the call will lack CF session data. Client should handle this.
+            }
+        }
 
         const newCall = {
           id: callId,
@@ -226,11 +678,15 @@ export default {
           status: callStatus,
           max_participants: max_participants || null,
           created_at: now,
-          participants: [{ user_id: creatorId, status: 'host' }] // Simplified participant list
+          participants: [{ user_id: creatorId, status: 'host' }],
+          cf_calls_session_id: cfSessionData ? cfSessionData.id : null,
+          cf_client_token: clientTokenForUser // Token for the client to join this specific CF Call session
         };
         return jsonResponse(newCall, 201);
+
       } catch (e) {
         console.error("Error creating video call:", e);
+        if (e.message.includes("ENCRYPTION_KEY")) return errorResponse(e.message, 500);
         return errorResponse("Failed to create video call: " + e.message, 500);
       }
     }
@@ -240,9 +696,9 @@ export default {
       if (!user) return errorResponse("Unauthorized", 401);
       try {
         const userId = user.userId;
-        // Fetch calls created by user OR where user is a participant
         const { results } = await env.D1_DB.prepare(
-          `SELECT DISTINCT vc.id, vc.room_name, vc.title, vc.start_time, vc.status, vc.created_by_user_id, vc.max_participants,
+          `SELECT DISTINCT vc.id, vc.room_name, vc.title, vc.start_time, vc.status, vc.created_by_user_id,
+                          vc.max_participants, vc.cf_calls_session_id, vc.cf_calls_data,
                   (SELECT COUNT(*) FROM call_participants cp_count WHERE cp_count.call_id = vc.id AND cp_count.left_at IS NULL) as current_participant_count
            FROM video_calls vc
            LEFT JOIN call_participants cp ON vc.id = cp.call_id
@@ -250,30 +706,81 @@ export default {
            ORDER BY vc.start_time DESC`
         ).bind(userId, userId).all();
 
-        return jsonResponse(results);
+        const callsWithClientTokens = results.map(call => {
+            let clientToken = null;
+            if (call.cf_calls_data) {
+                try {
+                    const cfData = JSON.parse(call.cf_calls_data);
+                    clientToken = cfData.token_for_client || null; // Extract the client token
+                } catch (parseError) {
+                    console.error(`Error parsing cf_calls_data for call ${call.id}:`, parseError);
+                }
+            }
+            // Return cf_calls_session_id and the extracted client token.
+            // Avoid returning the entire cf_calls_data to the client list.
+            return {
+                ...call,
+                cf_client_token: clientToken,
+                cf_calls_data: undefined // Remove the raw cf_calls_data
+            };
+        });
+        return jsonResponse(callsWithClientTokens);
       } catch (e) {
         console.error("Error fetching video calls:", e);
         return errorResponse("Failed to fetch video calls: " + e.message, 500);
       }
     }
 
-    // Regex for /api/video/calls/:callId/(join|leave)
-    const videoCallActionMatch = url.pathname.match(/^\/api\/video\/calls\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/(join|leave)$/i);
+    // Regex for /api/video/calls/:callId/(join|leave|signal)
+    // Signal path is new, join/leave are existing HTTP POST paths
+    const videoCallPathMatch = url.pathname.match(/^\/api\/video\/calls\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/(join|leave|signal)$/i);
 
-    if (videoCallActionMatch) {
+    if (videoCallPathMatch) {
       if (!user) return errorResponse("Unauthorized", 401);
-      const callId = videoCallActionMatch[1];
-      const action = videoCallActionMatch[2];
+      const callId = videoCallPathMatch[1];
+      const action = videoCallPathMatch[2];
       const userId = user.userId;
       const now = new Date().toISOString();
 
-      // Check if call exists
-      const call = await env.D1_DB.prepare("SELECT id, status, max_participants FROM video_calls WHERE id = ?").bind(callId).first();
-      if (!call) {
+      // Check if call exists (for join/leave, not strictly necessary for signal but good for consistency if we had other non-WS signal interactions)
+      const callForHttpActions = (action === "join" || action === "leave")
+          ? await env.D1_DB.prepare("SELECT id, status, max_participants FROM video_calls WHERE id = ?").bind(callId).first()
+          : null;
+
+      if ((action === "join" || action === "leave") && !callForHttpActions) {
         return errorResponse("Video call not found.", 404);
       }
 
+      // WebSocket Signaling Route
+      if (action === "signal" && request.method === "GET") {
+        try {
+            const doId = env.VIDEO_CALL_SIGNALING_DO.idFromString(callId);
+            const stub = env.VIDEO_CALL_SIGNALING_DO.get(doId);
+            const doRequest = new Request(request.url, request);
+            doRequest.headers.set("X-User-Id", userId);
+            return stub.fetch(doRequest);
+        } catch (e) {
+            console.error("Error forwarding WebSocket signaling request to DO:", e);
+            return errorResponse("Failed to establish signaling connection: " + e.message, 500);
+        }
+      }
+
+
       if (action === "join") {
+        // Use callForHttpActions, which is already fetched for join/leave
+        if (callForHttpActions.status === 'completed' || callForHttpActions.status === 'failed') {
+          return errorResponse("Cannot join a call that has already ended.", 400);
+        }
+
+        // Check max participants
+        if (callForHttpActions.max_participants) {
+          const { count } = await env.D1_DB.prepare(
+            "SELECT COUNT(*) as count FROM call_participants WHERE call_id = ? AND left_at IS NULL"
+          ).bind(callId).first();
+          if (count >= callForHttpActions.max_participants) {
+            return errorResponse("Call is full.", 403);
+          }
+        }
         if (call.status === 'completed' || call.status === 'failed') {
           return errorResponse("Cannot join a call that has already ended.", 400);
         }
@@ -674,69 +1181,149 @@ export default {
       }
     }
 
-    // Regex to match /api/conversations/:conversationId/messages
-    // Assumes conversationId is a UUID (standard format with hyphens)
-    const messageMatch = url.pathname.match(/^\/api\/conversations\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/messages$/i);
+    // Regex to match /api/conversations/:conversationId/messages OR /api/conversations/:conversationId/websocket
+    const conversationActionMatch = url.pathname.match(/^\/api\/conversations\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/(messages|websocket)$/i);
 
-    if (messageMatch) {
+    if (conversationActionMatch) {
       if (!user) return errorResponse("Unauthorized", 401);
-      const conversationId = messageMatch[1];
-      const userId = user.userId;
+      const conversationId = conversationActionMatch[1];
+      const actionPath = conversationActionMatch[2];
+      const userId = user.userId; // Authenticated user's ID
 
-      // Check if user is part of the conversation for both POST and GET
-      const participantCheck = await env.D1_DB.prepare(
-        "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?"
-      ).bind(conversationId, userId).first();
-
-      if (!participantCheck) {
-        return errorResponse("Forbidden: You are not a participant in this conversation.", 403);
-      }
-
-      // POST /api/conversations/:conversationId/messages - Create a new message
-      if (request.method === "POST") {
+      // WebSocket Upgrade Route for a specific conversation
+      if (actionPath === "websocket" && request.method === "GET") {
         try {
-          const body = await request.json();
-          const { content, message_type = 'text', media_url = null } = body;
+          const doId = env.CONVERSATION_DO.idFromString(conversationId);
+          const stub = env.CONVERSATION_DO.get(doId);
 
-          if (!content || content.trim() === "") {
-            return errorResponse("Message content cannot be empty.", 400);
-          }
+          // Forward the request to the DO, adding user ID for the DO to identify the sender
+          const doRequest = new Request(request.url, request);
+          doRequest.headers.set("X-User-Id", userId);
 
-          const messageId = crypto.randomUUID(); // Generate ID in JS
-          const now = new Date().toISOString();
-
-          await env.D1_DB.prepare(
-            "INSERT INTO messages (id, conversation_id, sender_id, content, message_type, media_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          ).bind(messageId, conversationId, userId, content, message_type, media_url, now, now).run();
-
-          // Update conversation's last_message_at and updated_at
-          await env.D1_DB.prepare(
-            "UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ?"
-          ).bind(now, now, conversationId).run();
-
-          // Fetch the created message with sender details (simplified)
-          const createdMessage = {
-            id: messageId,
-            conversation_id: conversationId,
-            sender_id: userId,
-            content,
-            message_type,
-            media_url,
-            created_at: now,
-            updated_at: now,
-            sender: { id: user.userId, name: user.name, profile_picture: user.profile_picture } // Assuming user object has name/profile_picture
-          };
-          // Note: user.name and user.profile_picture might not be in JWT. A DB query might be needed for full sender details.
-          // For now, this is a simplification.
-
-          return jsonResponse(createdMessage, 201);
+          return await stub.fetch(doRequest);
         } catch (e) {
-          console.error(`Error posting message to conversation ${conversationId}:`, e);
-          return errorResponse("Failed to send message: " + e.message, 500);
+          console.error("Error forwarding WebSocket request to DO:", e);
+          return errorResponse("Failed to establish WebSocket connection: " + e.message, 500);
         }
       }
 
-      // GET /api/conversations/:conversationId/messages - Get all messages for a conversation
+      // Existing messages API (POST and GET)
+      if (actionPath === "messages") {
+         // Check if user is part of the conversation for both POST and GET
+        const participantCheck = await env.D1_DB.prepare(
+          "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?"
+        ).bind(conversationId, userId).first();
+
+        if (!participantCheck) {
+          return errorResponse("Forbidden: You are not a participant in this conversation.", 403);
+        }
+
+        // POST /api/conversations/:conversationId/messages - Create a new message
+        if (request.method === "POST") {
+          try {
+            const body = await request.json();
+            const { content, message_type = 'text', media_url = null } = body;
+
+            if (!content || content.trim() === "") {
+              return errorResponse("Message content cannot be empty.", 400);
+            }
+
+            const messageId = crypto.randomUUID();
+            const now = new Date().toISOString();
+
+            // Fetch sender details (name, profile_picture) for the broadcasted message
+            const senderDetails = await env.D1_DB.prepare(
+              "SELECT name, profile_picture FROM users WHERE id = ?"
+            ).bind(userId).first();
+
+            const persistedMessage = {
+              id: messageId,
+              conversation_id: conversationId,
+              sender_id: userId,
+              content,
+              message_type,
+              media_url,
+              created_at: now,
+              updated_at: now,
+              sender: {
+                id: userId,
+                name: senderDetails?.name || "User", // Fallback name
+                profile_picture: senderDetails?.profile_picture || null
+              }
+            };
+
+            // Persist to D1
+            await env.D1_DB.prepare(
+              "INSERT INTO messages (id, conversation_id, sender_id, content, message_type, media_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ).bind(
+                persistedMessage.id,
+                persistedMessage.conversation_id,
+                persistedMessage.sender_id,
+                persistedMessage.content,
+                persistedMessage.message_type,
+                persistedMessage.media_url,
+                persistedMessage.created_at,
+                persistedMessage.updated_at
+            ).run();
+
+            await env.D1_DB.prepare(
+              "UPDATE conversations SET last_message_at = ?, updated_at = ? WHERE id = ?"
+            ).bind(now, now, conversationId).run();
+
+            // Trigger broadcast via DO
+            try {
+              const doId = env.CONVERSATION_DO.idFromString(conversationId);
+              const stub = env.CONVERSATION_DO.get(doId);
+              const doBroadcastUrl = new URL(`/broadcast-message`, request.url.origin);
+
+              ctx.waitUntil(stub.fetch(doBroadcastUrl.toString(), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(persistedMessage)
+              }));
+            } catch(doError) {
+                console.error(`Error calling DO for broadcast (ConvID: ${conversationId}): ${doError.message}`, doError.stack);
+            }
+
+            // Send Push Notifications from HTTP endpoint as well
+            ctx.waitUntil((async () => {
+                try {
+                    const participantsResult = await env.D1_DB.prepare(
+                        "SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ?"
+                    ).bind(conversationId, userId).all();
+
+                    if (participantsResult.results && participantsResult.results.length > 0) {
+                        const senderName = senderDetails?.name || "Someone"; // Name fetched earlier for persistedMessage
+                        for (const participant of participantsResult.results) {
+                            const subscriptionsResult = await env.D1_DB.prepare(
+                                "SELECT endpoint, keys_p256dh, keys_auth, user_id FROM push_subscriptions WHERE user_id = ?"
+                            ).bind(participant.user_id).all();
+
+                            if (subscriptionsResult.results) {
+                                for (const sub of subscriptionsResult.results) {
+                                    const pushPayload = JSON.stringify({
+                                        title: "New Message",
+                                        body: `${senderName}: ${content.substring(0,50)}${content.length > 50 ? '...' : ''}`, // use `content` from request body
+                                        data: { conversationId: conversationId, messageId: persistedMessage.id }
+                                    });
+                                    await sendPushNotification(sub, pushPayload, env);
+                                }
+                            }
+                        }
+                    }
+                } catch (pushError) {
+                    console.error(`HTTP Endpoint Push Notification Error (ConvID: ${conversationId}): ${pushError.message}`, pushError.stack);
+                }
+            })());
+
+            return jsonResponse(persistedMessage, 201);
+          } catch (e) {
+            console.error(`Error posting message to conversation ${conversationId}:`, e);
+            return errorResponse("Failed to send message: " + e.message, 500);
+          }
+        }
+
+        // GET /api/conversations/:conversationId/messages - Get all messages for a conversation
       if (request.method === "GET") {
         try {
           const { searchParams } = url;
@@ -1033,7 +1620,65 @@ export default {
       }
     }
 
+    // Push Notification Subscription Endpoints
+    if (url.pathname === "/api/notifications/subscribe" && request.method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+      try {
+        const body = await request.json();
+        const { subscription } = body;
+
+        if (!subscription || !subscription.endpoint || !subscription.keys || !subscription.keys.p256dh || !subscription.keys.auth) {
+          return errorResponse("Invalid subscription object provided.", 400);
+        }
+
+        // Use INSERT OR IGNORE to handle potential duplicate entries gracefully based on UNIQUE constraint
+        const { success, meta } = await env.D1_DB.prepare(
+          "INSERT OR IGNORE INTO push_subscriptions (user_id, endpoint, keys_p256dh, keys_auth) VALUES (?, ?, ?, ?)"
+        ).bind(user.userId, subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth).run();
+
+        if (!success) { // Should not happen with D1 if query is valid, but good practice
+            return errorResponse("Failed to store subscription.", 500);
+        }
+
+        // meta.changes will be 0 if the record was ignored (already exists), 1 if inserted.
+        if (meta.changes > 0) {
+            return jsonResponse({ message: "Subscription saved successfully." }, 201);
+        } else {
+            return jsonResponse({ message: "Subscription already exists." }, 200);
+        }
+
+      } catch (e) {
+        console.error("Error subscribing for push notifications:", e);
+        return errorResponse("Failed to subscribe: " + e.message, 500);
+      }
+    }
+
+    if (url.pathname === "/api/notifications/unsubscribe" && request.method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+      try {
+        const body = await request.json();
+        const { endpoint } = body;
+
+        if (!endpoint) {
+          return errorResponse("Endpoint is required to unsubscribe.", 400);
+        }
+
+        const { meta } = await env.D1_DB.prepare(
+          "DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?"
+        ).bind(user.userId, endpoint).run();
+
+        if (meta.changes > 0) {
+          return jsonResponse({ message: "Unsubscribed successfully." }, 200);
+        } else {
+          return jsonResponse({ message: "Subscription not found or already unsubscribed." }, 404);
+        }
+      } catch (e) {
+        console.error("Error unsubscribing from push notifications:", e);
+        return errorResponse("Failed to unsubscribe: " + e.message, 500);
+      }
+    }
+
     return errorResponse("Not Found", 404);
   },
 };
-export { MyDurableObject };
+export { MyDurableObject, ConversationDurableObject, VideoCallSignalingDO };
