@@ -696,6 +696,17 @@ async function hashPassword(password) {
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function hashPin(pin) {
+  if (typeof pin !== 'string' || pin.length === 0) {
+    throw new Error('PIN must be a non-empty string.');
+  }
+  const encoder = new TextEncoder();
+  const data = encoder.encode(pin);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join('');
+}
+
 async function getUser(request, env) { // env already passed
   const authHeader = request.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
@@ -708,30 +719,80 @@ import { sendEmail } from './services/microsoftGraphService.ts';
 
 const redirectUri = "https://its-just-us.your-account.workers.dev/auth/facebook/callback";
 
-const PUBLIC_ROUTES = [
-  "/test",
-  "/auth/facebook",
-  "/auth/facebook/callback",
-  "/auth/facebook/token",
-  "/auth/register",
-  "/auth/login",
-  "/auth/logout",
-  "/api/auth/request-password-reset",
-  "/api/auth/reset-password",
-  "/api/test-email"
-  // Note: /api/conversations and /api/conversations/:id/messages are NOT public
-];
-
+// PUBLIC_ROUTES is replaced by the new auth gate logic below
 
 export default {
   async fetch(request, env, ctx) { // Added ctx for waitUntil if needed later
     const url = new URL(request.url);
     const user = await getUser(request, env);
 
-    // Centralized Auth Check for non-public API routes
-    if (!PUBLIC_ROUTES.includes(url.pathname) && url.pathname.startsWith("/api/") && !user) {
+    // --- Start of new/refined auth gate logic ---
+    const pathname = url.pathname;
+    const method = request.method;
+
+    const isApiRoute = pathname.startsWith('/api/');
+    // const isAuthRoute = pathname.startsWith('/auth/'); // Auth routes have their own specific handling.
+
+    let isPublicApiRoute = false;
+    if (isApiRoute) {
+        const PUBLIC_API_PATHS = [ // List specific API paths that DON'T need a user session
+            "/api/auth/request-password-reset",
+            "/api/auth/reset-password",
+            "/api/test-email", // Assuming this was intended to be public for testing MS Graph
+            // Add any other public GET API endpoints if necessary (e.g., fetching public config)
+        ];
+        // Exact match for specific public API routes
+        if (PUBLIC_API_PATHS.includes(pathname)) {
+            isPublicApiRoute = true;
+        }
+        // Allow OPTIONS requests for CORS preflight on all API routes
+        if (method === "OPTIONS") {
+           isPublicApiRoute = true;
+        }
+    }
+
+    // Determine if the current request is for a known, explicitly unprotected frontend path.
+    // These are paths that the frontend router handles, and the backend should not interfere.
+    // This list is for documentation/clarity; static asset serving handles these.
+    const KNOWN_FRONTEND_PUBLIC_PATHS = [
+       "/", // Homepage
+       "/privacy-policy",
+       "/support",
+       "/user-data",
+       "/refund"
+    ];
+
+    let isKnownPublicFrontendPath = false;
+    for (const publicPath of KNOWN_FRONTEND_PUBLIC_PATHS) {
+       if (pathname === publicPath || (publicPath !== "/" && pathname.startsWith(publicPath + "/"))) {
+           isKnownPublicFrontendPath = true;
+           break;
+       }
+    }
+    if (pathname === "/") isKnownPublicFrontendPath = true;
+
+
+    // Apply authentication check:
+    // If the user is not authenticated AND
+    // the route is an API route AND
+    // it's not an explicitly public API route,
+    // THEN return Unauthorized.
+    // Non-API routes (isApiRoute = false) will bypass this check.
+    // Auth routes (pathname.startsWith('/auth/')) are handled by their specific logic later.
+    if (!user && isApiRoute && !isPublicApiRoute && !pathname.startsWith('/auth/')) {
         return errorResponse("Unauthorized", 401);
     }
+
+    // If an OPTIONS request made it here (not caught by isPublicApiRoute if more specific handling is desired)
+    // handle it generally.
+    if (method === 'OPTIONS') {
+       return new Response(null, { headers: {
+           'Access-Control-Allow-Origin': '*', // Adjust for your domain in production
+           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+           'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-Id',
+       }});
+    }
+    // --- End of new/refined auth gate logic ---
 
     if (url.pathname === "/test") {
       try {
@@ -2101,8 +2162,19 @@ export default {
       // Let's assume the `user` object *is* available because the callback is part of an authenticated session.
       // This would be true if the initial /auth/microsoft/initiate was done by an authenticated user
       // and the browser maintained that session.
-      if (!user) return errorResponse("User session not found during OAuth callback. Please log in to the app first.", 401);
-      const appUserId = user.userId;
+  if (!user && url.pathname !== "/auth/microsoft/callback") { // Allow callback to proceed without initial user for now
+        // This condition might need refinement based on how user context is established for the callback
+        // For other protected MS Graph routes, user would be required.
+  } else if (url.pathname.startsWith("/api/me/") && !user) { // Example of protecting other /api/me routes
+     return errorResponse("Unauthorized for MS Graph user data", 401);
+  }
+  // const appUserId = user ? user.userId : null; // Handle cases where user might not be strictly required for the callback itself.
+
+  // For the MS OAuth callback, the user context needs to be established carefully.
+  // If the state parameter correctly links back to an app session, user.userId can be retrieved.
+  // For this example, we'll proceed assuming `user.userId` is available if needed,
+  // acknowledging the complexity for the callback itself.
+  const appUserId = user ? user.userId : null;
 
 
       try {
@@ -2178,6 +2250,163 @@ export default {
         console.error("Error in MS Graph OAuth callback:", e);
         if (e.message.includes("ENCRYPTION_KEY")) return errorResponse(e.message, 500);
         return errorResponse("Failed to process Microsoft authentication callback: " + e.message, 500);
+      }
+    }
+
+    // Admin Test Harness API Endpoints
+    if (url.pathname === "/api/admin/test-harness/verify-pin" && request.method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+      // TODO: Add specific Admin Role Check if available in `user` object in future
+      // if (!user.roles || !user.roles.includes('admin')) return errorResponse("Forbidden", 403);
+
+      try {
+        const requestData = await request.json();
+        if (!requestData || typeof requestData.pin !== 'string' || requestData.pin.length === 0) {
+          return errorResponse("PIN is required and must be a non-empty string.", 400);
+        }
+
+        const storedPin = await env.D1_DB.prepare("SELECT pin_hash FROM admin_test_access WHERE id = 1").first();
+        if (!storedPin || !storedPin.pin_hash) {
+          return errorResponse("Admin PIN not configured in the system.", 500);
+        }
+
+        const hashedPinFromRequest = await hashPin(requestData.pin);
+
+        if (hashedPinFromRequest === storedPin.pin_hash) {
+          // Optional: Could issue a short-lived token here for subsequent test harness actions
+          return jsonResponse({ verified: true, message: "PIN verified successfully." });
+        } else {
+          return errorResponse("Invalid PIN.", 403);
+        }
+      } catch (e) {
+        console.error("Error in /api/admin/test-harness/verify-pin:", e);
+        if (e.message === 'PIN must be a non-empty string.') return errorResponse(e.message, 400);
+        return errorResponse("An error occurred during PIN verification: " + e.message, 500);
+      }
+    }
+
+    if (url.pathname === "/api/admin/test-harness/db/initialize" && request.method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+      // TODO: Add specific Admin Role Check
+      // if (!user.roles || !user.roles.includes('admin')) return errorResponse("Forbidden", 403);
+      // Optional: Check for recent PIN verification if a mechanism for that exists
+
+      try {
+        const sampleSeedSql = `
+          INSERT OR IGNORE INTO email_templates (template_name, subject_template, body_html_template, default_sender_name, default_sender_email, created_at, updated_at) VALUES ('test_harness_template_1', 'Test Harness Subject 1', '<p>Test Body 1 for {{name}} from Test Harness</p>', 'Test Harness Sender', 'test@example.com', datetime('now'), datetime('now'));
+          INSERT OR IGNORE INTO seasonal_themes (name, description, start_date, end_date, theme_config_json, is_active, created_at, updated_at) VALUES ('TestHarnessTheme1', 'A test theme initialized by the test harness', date('now'), date('now', '+1 month'), '{"primaryColor":"#BADA55", "font":"Arial"}', 0, datetime('now'), datetime('now'));
+          -- Add a dummy user for testing relations, if password_hash is not nullable, provide one.
+          -- INSERT OR IGNORE INTO users (id, name, email, password_hash) VALUES ('test-harness-user-01', 'Test Harness User', 'test-harness@example.com', 'dummy_hash_for_test_user');
+        `;
+
+        // Note: D1's exec() can run multiple statements separated by semicolons.
+        const result = await env.D1_DB.exec(sampleSeedSql);
+
+        if (result.error) {
+          console.error("DB Initialization via test harness failed:", result.error);
+          return errorResponse(`DB Initialization failed: ${result.error}`, 500);
+        }
+
+        // D1 exec() result object for multiple statements might not give individual counts easily.
+        // It gives { count: number_of_statements_executed, duration: time_in_ms }
+        // We assume success if no error is thrown.
+        return jsonResponse({
+          success: true,
+          message: "Sample database initialization executed successfully.",
+          statements_executed: result.count, // Number of statements D1 attempted
+          duration: result.duration
+        });
+
+      } catch (e) {
+        console.error("Error in /api/admin/test-harness/db/initialize:", e);
+        return errorResponse("An error occurred during DB initialization: " + e.message, 500);
+      }
+    }
+
+    }
+
+    // Admin Test Harness - Part 2: Test Token Generation & User Creation
+    if (url.pathname === "/api/admin/test-harness/generate-test-token" && request.method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+      // TODO: Add specific Admin Role Check
+
+      try {
+        const requestData = await request.json();
+        const { userId: targetUserId, role: requestedRole, expiresInMinutes } = requestData;
+
+        if (!targetUserId || typeof targetUserId !== 'string') {
+          return errorResponse("Target userId is required and must be a string.", 400);
+        }
+
+        const targetUser = await env.D1_DB.prepare("SELECT email FROM users WHERE id = ?").bind(targetUserId).first();
+        if (!targetUser) {
+          return errorResponse("Target user not found.", 404);
+        }
+
+        const minutes = parseInt(expiresInMinutes) || 10; // Default to 10 minutes
+        const expiration = Math.floor(Date.now() / 1000) + (minutes * 60);
+
+        const payload = {
+          userId: targetUserId,
+          email: targetUser.email,
+          // role: requestedRole || targetUser.role, // Uncomment and adapt if users.role exists
+          exp: expiration,
+          jti: crypto.randomUUID(),
+          isTestToken: true // Special claim for test tokens
+        };
+
+        const testToken = await signToken(payload, env.JWT_SECRET);
+        return jsonResponse({ userId: targetUserId, testToken: testToken, expiresAt: new Date(expiration * 1000).toISOString() });
+
+      } catch (e) {
+        console.error("Error in /api/admin/test-harness/generate-test-token:", e);
+        return errorResponse("An error occurred during test token generation: " + e.message, 500);
+      }
+    }
+
+    if (url.pathname === "/api/admin/test-harness/create-test-user" && request.method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+      // TODO: Add specific Admin Role Check
+
+      try {
+        const requestData = await request.json();
+        const { name, email, password, role: requestedRole } = requestData; // role is optional for now
+
+        if (!name || typeof name !== 'string' || name.trim() === "") {
+          return errorResponse("User name is required.", 400);
+        }
+        if (!email || typeof email !== 'string' || !email.includes('@')) { // Basic email validation
+          return errorResponse("A valid email is required.", 400);
+        }
+        if (!password || typeof password !== 'string' || password.length < 6) { // Basic password length
+          return errorResponse("Password is required and must be at least 6 characters.", 400);
+        }
+
+        const hashedPassword = await hashPassword(password);
+        const newUserId = crypto.randomUUID().replace(/-/g, ''); // Generate UUID for user ID, matching schema
+
+        // Assuming 'users' table does NOT have a 'role' column yet, per subtask self-correction.
+        // If 'role' column is added later, this SQL and binding needs to be updated.
+        await env.D1_DB.prepare(
+          "INSERT INTO users (id, name, email, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))"
+        ).bind(newUserId, name, email, hashedPassword).run();
+
+        // Log the audit event
+        // Assuming `user.userId` is the ID of the admin performing the action
+        await logAuditEvent(env, request, 'create_test_user', user.userId, 'user', newUserId, 'success', { testUserName: name, testUserEmail: email });
+
+        return jsonResponse({ message: "Test user created successfully.", userId: newUserId, email: email }, 201);
+
+      } catch (e) {
+        console.error("Error in /api/admin/test-harness/create-test-user:", e);
+        if (e.message && e.message.toLowerCase().includes("unique constraint failed: users.email")) {
+          return errorResponse("Email already exists.", 409);
+        }
+        if (e.message && e.message.toLowerCase().includes("unique constraint failed: users.id")) {
+          // Extremely unlikely with UUIDs but good to be aware of
+          return errorResponse("User ID generation conflict. Please try again.", 500);
+        }
+        return errorResponse("An error occurred during test user creation: " + e.message, 500);
       }
     }
 

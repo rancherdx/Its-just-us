@@ -12,7 +12,7 @@ migrations = true # Ensure this line is present or added
 
 [migrations]
 dir = "./migrations" # Specifies the directory for all migrations (D1 .sql files, DO new_classes)
-tag = "v10_calendar_sync_oauth_state" # New tag
+tag = "v12_admin_harness_part1" # Updated tag for admin test harness part 1 completion
 new_classes = ["MyDurableObject", "ConversationDurableObject", "VideoCallSignalingDO"] # Add new DO
 
 [durable_objects]
@@ -24,6 +24,10 @@ bindings = [
 
 [observability]
 enabled = true
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "your_kv_namespace_id_for_rate_limiting" # TODO: Replace with actual KV namespace ID
 
 # 🔥 Added R2 Storage Buckets
 [[r2_buckets]]
