@@ -715,6 +715,18 @@ async function getUser(request, env) { // env already passed
   return await verifyToken(token, env.JWT_SECRET, env);
 }
 
+// RBAC Helper Function
+function requireRole(user, allowedRoles) {
+  if (!user || !user.role) {
+    return false; // No user or no role property on user object
+  }
+  if (!Array.isArray(allowedRoles)) {
+    console.error("requireRole: allowedRoles must be an array.");
+    return false;
+  }
+  return allowedRoles.includes(user.role);
+}
+
 import { sendEmail } from './services/microsoftGraphService.ts';
 
 const redirectUri = "https://its-just-us.your-account.workers.dev/auth/facebook/callback";
@@ -793,6 +805,64 @@ export default {
        }});
     }
     // --- End of new/refined auth gate logic ---
+
+    // Super Admin Role Check for /api/admin/* routes
+    // This block is placed after the general authentication gate and before specific admin route handlers.
+    if (pathname.startsWith('/api/admin/')) {
+      // Ensure user is authenticated first (guaranteed if the main auth gate is effective)
+      if (!user) {
+        // This check is somewhat redundant due to the main auth gate but provides clear, explicit protection.
+        return errorResponse("Unauthorized: Admin authentication required.", 401);
+      }
+
+      if (!requireRole(user, ['super_admin'])) {
+        // Log the unauthorized access attempt
+        if (typeof logAuditEvent === 'function') { // Check if logAuditEvent is available
+           ctx.waitUntil(logAuditEvent(env, request, 'admin_access_denied', user.userId, 'admin_route_access', pathname, 'failure', { attemptedRole: user.role || 'unknown' }));
+        } else {
+           console.warn("logAuditEvent function not available for admin_access_denied event.");
+        }
+        return errorResponse("Forbidden: You do not have sufficient privileges to access this resource.", 403);
+      }
+      // If execution reaches here, user is authenticated AND is a super_admin.
+    }
+
+    // API Endpoint: Get Family Members
+    if (pathname === "/api/me/family/members" && method === "GET") {
+      if (!user) {
+        // This check is technically redundant if the main auth gate correctly protects all /api/ routes not explicitly public.
+        // However, it's good for clarity on routes that absolutely need a user.
+        return errorResponse("Unauthorized: Authentication required.", 401);
+      }
+
+      const { userId, role, family_id: userFamilyId } = user;
+
+      // Authorization: Only family_admin or super_admin can list family members.
+      if (!requireRole(user, ['family_admin', 'super_admin'])) {
+        if (typeof logAuditEvent === 'function') {
+          ctx.waitUntil(logAuditEvent(env, request, 'family_members_access_denied', userId, 'family_members_list', userFamilyId || 'N/A', 'failure', { reason: 'Insufficient role' }));
+        }
+        return errorResponse("Forbidden: You do not have permission to view family members.", 403);
+      }
+
+      if (!userFamilyId) {
+        // This case should be rare for a family_admin due to registration logic.
+        // For a super_admin, they might not be part of a family, or they might need a different way to specify which family to view.
+        // For this endpoint (/api/me/family/members), it implies "my current family".
+        return jsonResponse({ message: "User is not associated with a family." }, 404);
+      }
+
+      try {
+        const { results: familyMembers } = await env.D1_DB.prepare(
+          "SELECT id, name, email, role, date_of_birth, profile_picture, created_at, last_seen_at FROM users WHERE family_id = ?"
+        ).bind(userFamilyId).all();
+
+        return jsonResponse(familyMembers || []);
+      } catch (e) {
+        console.error(`Error fetching family members for family_id ${userFamilyId}:`, e);
+        return errorResponse("Failed to fetch family members: " + e.message, 500);
+      }
+    }
 
     if (url.pathname === "/test") {
       try {
@@ -1250,68 +1320,111 @@ export default {
     // Email/Password Register
     if (request.method === "POST" && url.pathname === "/auth/register") {
       try {
-        const { name, email, password } = await request.json();
+        const requestData = await request.json(); // Use requestData to access all potential fields
+        const { name, email, password, date_of_birth } = requestData;
+
         if (!name || !email || !password) {
-          return new Response(JSON.stringify({ message: "Missing name, email, or password" }), { status: 400, headers: { "Content-Type": "application/json" } });
+          return errorResponse("Name, email, and password are required.", 400);
+        }
+        // Basic validation for DOB format if provided
+        if (date_of_birth && !/^\d{4}-\d{2}-\d{2}$/.test(date_of_birth)) {
+          return errorResponse("date_of_birth must be in YYYY-MM-DD format.", 400);
         }
 
         const hashedPassword = await hashPassword(password);
+        const newUserId = crypto.randomUUID();
+        const familyId = crypto.randomUUID();
+        const userRole = 'family_admin'; // New users create a family and become its admin
+        const now = new Date().toISOString();
+        const dob = date_of_birth || null;
 
-        // Insert user into database
+        // Create the family first
+        // Use requestData.name for family_name, or a default if name is not suitable for family name.
+        const familyName = `${name}'s Family` // Example default family name
         await env.D1_DB.prepare(
-          "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)"
-        ).bind(name, email, hashedPassword).run();
+          "INSERT INTO families (id, created_by_user_id, family_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+        ).bind(familyId, newUserId, familyName, now, now).run();
+
+        // Then insert the user
+        await env.D1_DB.prepare(
+          "INSERT INTO users (id, name, email, password_hash, role, family_id, date_of_birth, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(newUserId, name, email, hashedPassword, userRole, familyId, dob, now, now).run();
+
+        // Log registration event (before sending email or token, in case those fail)
+        await logAuditEvent(env, request, 'register', newUserId, 'user', newUserId, 'success', { email: email, role: userRole, familyId: familyId });
 
         // Send welcome email using template
         try {
           const { subject, bodyHtml } = await getProcessedEmailTemplate(
             'welcome_email',
-            { name: name, appName: "It's Just Us" },
+            { name: name, appName: "It's Just Us" }, // Use name from requestData
             env
           );
 
-          console.log(`Attempting to send welcome email to: ${email}`);
+          console.log(`Attempting to send welcome email to: ${email}`); // Use email from requestData
           sendEmail(env, { to: email, subject, htmlBody: bodyHtml })
-            .then(success => {
-              if (success) {
+            .then(emailSuccess => { // Renamed variable to avoid conflict
+              if (emailSuccess) {
                 console.log(`Welcome email successfully dispatched to ${email}.`);
               } else {
                 console.error(`Failed to dispatch welcome email to ${email}.`);
               }
-            }).catch(error => {
-              console.error(`Error sending welcome email to ${email}:`, error);
+            }).catch(emailError => { // Renamed variable
+              console.error(`Error sending welcome email to ${email}:`, emailError);
             });
         } catch (templateError) {
             console.error("Error processing welcome email template:", templateError);
-            // Welcome email is best-effort, don't fail registration if template is missing/broken.
         }
 
-        return jsonResponse({ message: "User registered successfully. A welcome email is being sent." }, 201);
+        // Prepare token payload with new RBAC fields
+        const tokenPayload = {
+            userId: newUserId,
+            email: email,
+            role: userRole,
+            family_id: familyId
+            // exp and jti are added by signToken
+        };
+        const token = await signToken(tokenPayload, env.JWT_SECRET);
+
+        // Update response to include new user fields
+        return jsonResponse({
+          message: "User registered successfully. A welcome email is being sent.",
+          token: token, // Send token immediately upon registration
+          user: {
+            id: newUserId,
+            name: name,
+            email: email,
+            role: userRole,
+            family_id: familyId,
+            date_of_birth: dob
+            // profile_picture will be null initially
+          }
+        }, 201);
 
       } catch (dbError) {
-        // Check for unique constraint error for email
         if (dbError.message && dbError.message.includes("UNIQUE constraint failed: users.email")) {
-          console.error("Registration failed: Email already exists.", dbError);
-          return new Response(JSON.stringify({ message: "Email already exists. Please use a different email or login." }), {
-            status: 409, // Conflict
-            headers: { "Content-Type": "application/json" }
-          });
+          return errorResponse("Email already exists. Please use a different email or login.", 409);
+        }
+        if (dbError.message && dbError.message.includes("UNIQUE constraint failed: families.id")) {
+          // This could happen if UUID collision, though extremely rare.
+          // Or if family creation failed silently and user insert then violates FK if that was added.
+          // For now, general error.
+          console.error("Family ID collision or related error during registration:", dbError);
+          return errorResponse("Error during family setup in registration.", 500);
         }
         console.error("Error during registration:", dbError);
-        return new Response(JSON.stringify({ message: "Error during registration.", error: dbError.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" }
-        });
+        return errorResponse("Error during registration: " + dbError.message, 500);
       }
     }
 
     // Email/Password Login
     if (request.method === "POST" && url.pathname === "/auth/login") {
-      const requestData = await request.json(); // Store request data for potential use in logging
+      const requestData = await request.json();
       const { email, password } = requestData;
       const hashedPassword = await hashPassword(password);
+      // Updated SELECT to fetch role and family_id
       const dbUser = await env.D1_DB.prepare(
-        "SELECT id, email, name, profile_picture FROM users WHERE email = ? AND password_hash = ?"
+        "SELECT id, name, email, password_hash, profile_picture, role, family_id, date_of_birth FROM users WHERE email = ? AND password_hash = ?"
       ).bind(email, hashedPassword).first();
 
       const ipAddress = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || "unknown";
@@ -1319,7 +1432,6 @@ export default {
 
       if (!dbUser) {
         await logAuditEvent(env, request, 'login_failed', null, 'user', email, 'failure', { reason: 'Invalid credentials' });
-        // Log failed login attempt
         try {
             await env.D1_DB.prepare(
                 "INSERT INTO failed_login_attempts (attempted_identifier, ip_address, user_agent) VALUES (?, ?, ?)"
@@ -1330,12 +1442,10 @@ export default {
         return errorResponse("Invalid credentials", 401);
       }
 
-      // Log successful login
       await logAuditEvent(env, request, 'login', dbUser.id, 'user', dbUser.id, 'success');
 
-      // Record/Update known IP for the user
       try {
-        const now = new Date().toISOString();
+        const loginTimestamp = new Date().toISOString(); // Use consistent timestamp for login
         const existingIp = await env.D1_DB.prepare(
           "SELECT id FROM user_known_ips WHERE user_id = ? AND ip_address = ?"
         ).bind(dbUser.id, ipAddress).first();
@@ -1343,28 +1453,44 @@ export default {
         if (existingIp) {
           await env.D1_DB.prepare(
             "UPDATE user_known_ips SET last_seen_at = ? WHERE id = ?"
-          ).bind(now, existingIp.id).run();
+          ).bind(loginTimestamp, existingIp.id).run();
         } else {
           await env.D1_DB.prepare(
             "INSERT INTO user_known_ips (user_id, ip_address, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)"
-          ).bind(dbUser.id, ipAddress, now, now).run();
+          ).bind(dbUser.id, ipAddress, loginTimestamp, loginTimestamp).run();
         }
+        // Update user's last_seen_at
+        await env.D1_DB.prepare("UPDATE users SET last_seen_at = ? WHERE id = ?").bind(loginTimestamp, dbUser.id).run();
+
       } catch (ipTrackingError) {
-          console.error("Error tracking user IP:", ipTrackingError);
-          // Non-critical error, so login can proceed
+          console.error("Error tracking user IP or last_seen_at:", ipTrackingError);
       }
 
-      // Payload for signToken should ideally include only necessary, non-sensitive info for the client/session
+      // Updated tokenPayload to include role and family_id
       const tokenPayload = {
         userId: dbUser.id,
         email: dbUser.email,
-        name: dbUser.name, // Optional: include name if useful in client-side user object
-        profile_picture: dbUser.profile_picture, // Optional
-        // exp is now handled by signToken by default
+        name: dbUser.name,
+        role: dbUser.role, // Added role
+        family_id: dbUser.family_id, // Added family_id
+        profile_picture: dbUser.profile_picture
+        // exp and jti are added by signToken
       };
       const token = await signToken(tokenPayload, env.JWT_SECRET);
 
-      return jsonResponse({ token, user: {id: dbUser.id, name: dbUser.name, email: dbUser.email, profile_picture: dbUser.profile_picture }});
+      // Updated user object in response to include role and family_id
+      return jsonResponse({
+        token,
+        user: {
+          id: dbUser.id,
+          name: dbUser.name,
+          email: dbUser.email,
+          profile_picture: dbUser.profile_picture,
+          role: dbUser.role,
+          family_id: dbUser.family_id,
+          date_of_birth: dbUser.date_of_birth
+        }
+      });
     }
 
     // Logout - Now requires token to blocklist
