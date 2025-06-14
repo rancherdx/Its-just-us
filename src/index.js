@@ -864,6 +864,228 @@ export default {
       }
     }
 
+    // API Endpoint: Assign user to family
+    if (pathname === "/api/me/family/members/assign" && method === "POST") {
+      if (!user) return errorResponse("Unauthorized", 401);
+
+      const { userId: adminUserId, role: adminRole, family_id: adminFamilyId } = user;
+
+      if (!requireRole(user, ['family_admin', 'super_admin'])) {
+        ctx.waitUntil(logAuditEvent(env, request, 'assign_family_member_denied', adminUserId, 'family_assignment', adminFamilyId || 'N/A', 'failure', { reason: 'Insufficient role' }));
+        return errorResponse("Forbidden: You do not have permission to assign users to a family.", 403);
+      }
+
+      if (!adminFamilyId && adminRole === 'family_admin') { // Super_admin might not have a family_id themselves if they operate globally
+          return errorResponse("Forbidden: Family Admin must be associated with a family to assign members.", 403);
+      }
+
+      try {
+        const requestData = await request.json();
+        const { emailToAssign, roleToAssign: rawRoleToAssign } = requestData;
+        const roleToAssign = rawRoleToAssign || 'parent'; // Default to 'parent'
+
+        if (!emailToAssign || typeof emailToAssign !== 'string') {
+          return errorResponse("Email of the user to assign is required.", 400);
+        }
+        if (!['parent', 'child'].includes(roleToAssign)) {
+          return errorResponse("Invalid role to assign. Must be 'parent' or 'child'.", 400);
+        }
+
+        const targetUser = await env.D1_DB.prepare("SELECT id, family_id FROM users WHERE email = ?").bind(emailToAssign).first();
+        if (!targetUser) {
+          return errorResponse("User with this email not found.", 404);
+        }
+        if (targetUser.family_id) {
+          return errorResponse("User is already part of a family.", 409);
+        }
+
+        const familyIdToAssign = adminFamilyId; // Family admin assigns to their own family
+
+        await env.D1_DB.prepare(
+          "UPDATE users SET family_id = ?, role = ?, updated_at = datetime('now') WHERE id = ?"
+        ).bind(familyIdToAssign, roleToAssign, targetUser.id).run();
+
+        ctx.waitUntil(logAuditEvent(env, request, 'assign_family_member', adminUserId, 'user', targetUser.id, 'success', { assigned_role: roleToAssign, family_id: familyIdToAssign }));
+        return jsonResponse({ message: "User successfully assigned to family." });
+
+      } catch (e) {
+        console.error("Error assigning user to family:", e);
+        return errorResponse("Failed to assign user to family: " + e.message, 500);
+      }
+    }
+
+    // API Endpoint: Update family member's role OR Remove family member
+    const familyMemberActionMatch = pathname.match(/^\/api\/me\/family\/members\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\/(role))?$/i);
+    if (familyMemberActionMatch) {
+      if (!user) return errorResponse("Unauthorized", 401);
+
+      const { userId: adminUserId, role: adminRole, family_id: adminFamilyId } = user;
+      const targetUserId = familyMemberActionMatch[1];
+      const isRoleUpdate = familyMemberActionMatch[2] === 'role';
+
+      if (!requireRole(user, ['family_admin', 'super_admin'])) {
+         const actionType = isRoleUpdate ? 'update_member_role_denied' : 'remove_member_denied';
+         ctx.waitUntil(logAuditEvent(env, request, actionType, adminUserId, 'family_member_management', targetUserId, 'failure', { reason: 'Insufficient role' }));
+         return errorResponse("Forbidden: You do not have permission for this family management action.", 403);
+      }
+
+      if (!adminFamilyId && adminRole === 'family_admin') {
+           return errorResponse("Forbidden: Family Admin must be associated with a family to manage members.", 403);
+      }
+
+      // Fetch target user
+      const targetUser = await env.D1_DB.prepare("SELECT id, email, role, family_id FROM users WHERE id = ?").bind(targetUserId).first();
+      if (!targetUser) {
+        return errorResponse("Target user not found.", 404);
+      }
+
+      // Family Admin specific checks
+      if (adminRole === 'family_admin') {
+        if (targetUser.family_id !== adminFamilyId) {
+          return errorResponse("Forbidden: Cannot manage users outside your own family.", 403);
+        }
+        if (targetUser.role === 'super_admin') {
+          return errorResponse("Forbidden: Family administrators cannot modify super administrators.", 403);
+        }
+      }
+      // Super_admin can manage any user in any family (or no family), but still can't make them super_admin via this endpoint.
+
+      if (isRoleUpdate && method === "PUT") { // PUT /api/me/family/members/:targetUserId/role
+        try {
+          const requestData = await request.json();
+          const { newRole } = requestData;
+
+          if (!newRole || !['parent', 'child', 'family_admin'].includes(newRole)) {
+            return errorResponse("Invalid new role. Must be 'parent', 'child', or 'family_admin'.", 400);
+          }
+          // Prevent assigning 'super_admin' role via this endpoint by anyone.
+          if (newRole === 'super_admin') {
+              return errorResponse("Forbidden: Cannot assign 'super_admin' role via this endpoint.", 403);
+          }
+
+          await env.D1_DB.prepare(
+            "UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?"
+          ).bind(newRole, targetUserId).run();
+
+          ctx.waitUntil(logAuditEvent(env, request, 'update_family_member_role', adminUserId, 'user', targetUserId, 'success', { old_role: targetUser.role, new_role: newRole, family_id: targetUser.family_id }));
+          return jsonResponse({ message: "User role updated successfully." });
+
+        } catch (e) {
+          console.error(`Error updating role for user ${targetUserId}:`, e);
+          return errorResponse("Failed to update user role: " + e.message, 500);
+        }
+      } else if (!isRoleUpdate && method === "DELETE") { // DELETE /api/me/family/members/:targetUserId
+        try {
+          if (targetUser.id === adminUserId && adminRole === 'family_admin') {
+            const { results: adminCountResult } = await env.D1_DB.prepare(
+              "SELECT COUNT(*) as admin_count FROM users WHERE family_id = ? AND role = 'family_admin'"
+            ).bind(adminFamilyId).first();
+
+            const adminCount = adminCountResult.admin_count;
+            if (adminCount <= 1) {
+              return errorResponse("Cannot remove self as the only family administrator. Assign another admin first or delete the family (future feature).", 400);
+            }
+          }
+
+          // When removing, set family_id to NULL and role to 'user' (a generic default)
+          await env.D1_DB.prepare(
+            "UPDATE users SET family_id = NULL, role = 'user', updated_at = datetime('now') WHERE id = ?"
+          ).bind(targetUserId).run();
+
+          ctx.waitUntil(logAuditEvent(env, request, 'remove_family_member', adminUserId, 'user', targetUserId, 'success', { old_family_id: targetUser.family_id, old_role: targetUser.role }));
+          return jsonResponse({ message: "User removed from family successfully." });
+        } catch (e) {
+          console.error(`Error removing user ${targetUserId} from family:`, e);
+          return errorResponse("Failed to remove user from family: " + e.message, 500);
+        }
+      } else {
+        return errorResponse("Method not allowed for this resource.", 405);
+      }
+    }
+
+    // Parental Controls Endpoints
+    const parentalControlsMatch = pathname.match(/^\/api\/me\/family\/children\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/controls$/i);
+    if (parentalControlsMatch) {
+      if (!user) return errorResponse("Unauthorized", 401);
+
+      const { userId: adminOrParentUserId, role: adminOrParentRole, family_id: adminOrParentFamilyId } = user;
+      const childUserId = parentalControlsMatch[1];
+
+      // Authorization Check: Caller must be family_admin or parent
+      if (!requireRole(user, ['family_admin', 'parent'])) {
+        ctx.waitUntil(logAuditEvent(env, request, 'parental_controls_auth_failed', adminOrParentUserId, 'parental_controls', childUserId, 'failure', { reason: 'Insufficient role' }));
+        return errorResponse("Forbidden: You do not have permission to manage these settings.", 403);
+      }
+
+      if (!adminOrParentFamilyId) {
+         return errorResponse("Forbidden: You must be part of a family to manage parental controls.", 403);
+      }
+
+      // Fetch child user details to verify they are a child and in the same family
+      const childUser = await env.D1_DB.prepare("SELECT id, role, family_id FROM users WHERE id = ?").bind(childUserId).first();
+      if (!childUser) {
+        return errorResponse("Child user not found.", 404);
+      }
+      if (childUser.role !== 'child') {
+        return errorResponse("Target user is not a child account.", 400);
+      }
+      if (childUser.family_id !== adminOrParentFamilyId) {
+        return errorResponse("Forbidden: Cannot manage parental controls for a child outside your family.", 403);
+      }
+
+      // GET /api/me/family/children/:childUserId/controls
+      if (method === "GET") {
+        try {
+          const settingsRow = await env.D1_DB.prepare(
+            "SELECT settings_json FROM parental_control_settings WHERE child_user_id = ?"
+          ).bind(childUserId).first();
+
+          ctx.waitUntil(logAuditEvent(env, request, 'view_parental_controls', adminOrParentUserId, 'parental_controls', childUserId, 'success'));
+
+          if (settingsRow && settingsRow.settings_json) {
+            return jsonResponse(JSON.parse(settingsRow.settings_json));
+          } else {
+            return jsonResponse({}); // No settings found, return empty object
+          }
+        } catch (e) {
+          console.error(`Error fetching parental controls for child ${childUserId}:`, e);
+          return errorResponse("Failed to fetch parental controls: " + e.message, 500);
+        }
+      }
+
+      // PUT /api/me/family/children/:childUserId/controls
+      if (method === "PUT") {
+        try {
+          const requestData = await request.json();
+          // Basic validation (can be expanded)
+          if (typeof requestData !== 'object' || requestData === null) {
+            return errorResponse("Invalid settings format. Expected a JSON object.", 400);
+          }
+          // Example: Validate DND times if present
+          if (requestData.dnd_start_time && !/^\d{2}:\d{2}$/.test(requestData.dnd_start_time) ||
+              requestData.dnd_end_time && !/^\d{2}:\d{2}$/.test(requestData.dnd_end_time) ) {
+             return errorResponse("Invalid DND time format. Use HH:MM.", 400);
+          }
+          if (requestData.screen_time_limit_minutes && typeof requestData.screen_time_limit_minutes !== 'number') {
+             return errorResponse("screen_time_limit_minutes must be a number.", 400);
+          }
+
+          const settingsJsonString = JSON.stringify(requestData);
+
+          await env.D1_DB.prepare(
+            "INSERT INTO parental_control_settings (child_user_id, settings_json, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(child_user_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = datetime('now')"
+          ).bind(childUserId, settingsJsonString).run();
+
+          ctx.waitUntil(logAuditEvent(env, request, 'update_parental_controls', adminOrParentUserId, 'parental_controls', childUserId, 'success', { settings: requestData } ));
+          return jsonResponse({ message: "Parental controls updated successfully.", settings: requestData });
+
+        } catch (e) {
+          console.error(`Error updating parental controls for child ${childUserId}:`, e);
+          return errorResponse("Failed to update parental controls: " + e.message, 500);
+        }
+      }
+    }
+
     if (url.pathname === "/test") {
       try {
         // Example: Test if users table exists and has data (optional)
@@ -2454,6 +2676,7 @@ export default {
     // Admin Test Harness - Part 2: Test Token Generation & User Creation
     if (url.pathname === "/api/admin/test-harness/generate-test-token" && request.method === "POST") {
       if (!user) return errorResponse("Unauthorized", 401);
+      // Super admin check is already done for /api/admin/* paths
       // TODO: Add specific Admin Role Check
 
       try {
@@ -2492,7 +2715,7 @@ export default {
 
     if (url.pathname === "/api/admin/test-harness/create-test-user" && request.method === "POST") {
       if (!user) return errorResponse("Unauthorized", 401);
-      // TODO: Add specific Admin Role Check
+      // Super admin check is already done for /api/admin/* paths
 
       try {
         const requestData = await request.json();
