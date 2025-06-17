@@ -15,7 +15,31 @@ INSERT OR IGNORE INTO seasonal_themes (name, description, start_date, end_date, 
 INSERT OR IGNORE INTO email_templates (template_name, subject_template, body_html_template, default_sender_name, default_sender_email) VALUES
 ('welcome_email', 'Welcome to {{appName}}, {{name}}!', '<html><body><h1>Hi {{name}},</h1><p>Thanks for joining {{appName}}. We are excited to have you!</p><p>Regards,<br/>The {{appName}} Team</p></body></html>', NULL, NULL),
 ('password_reset_email', 'Password Reset Request for {{appName}}', '<html><body><p>Hi {{name}},</p><p>You requested a password reset for your account with {{appName}}.</p><p>Please click this link to reset your password: <a href="{{resetLink}}">{{resetLink}}</a></p><p>This link is valid for {{expiryMinutes}} minutes.</p><p>If you did not request this, please ignore this email.</p><p>Regards,<br/>The {{appName}} Team</p></body></html>', NULL, NULL),
-('password_changed_confirmation', 'Your Password for {{appName}} Has Been Changed', '<html><body><p>Hi {{name}},</p><p>This email confirms that your password for your {{appName}} account was successfully changed.</p><p>If you did not make this change, please contact our support team immediately.</p><p>Regards,<br/>The {{appName}} Team</p></body></html>', NULL, NULL);
+('password_changed_confirmation', 'Your Password for {{appName}} Has Been Changed', '<html><body><p>Hi {{name}},</p><p>This email confirms that your password for your {{appName}} account was successfully changed.</p><p>If you did not make this change, please contact our support team immediately.</p><p>Regards,<br/>The {{appName}} Team</p></body></html>', NULL, NULL),
+('family_invitation_email', 'You''re invited to join the {{familyName}} family on {{appName}}!', '<!DOCTYPE html>
+     <html>
+     <head>
+       <meta charset="utf-g">
+       <title>Family Invitation</title>
+     </head>
+     <body>
+       <p>Hi {{invitedEmailOrName}},</p>
+       <p>{{inviterName}} has invited you to join their family, "{{familyName}}", on {{appName}} as a {{roleToAssign}}.</p>
+       <p>If you wish to accept this invitation, please click the link below:</p>
+       <p><a href="{{inviteLink}}">Accept Invitation</a></p>
+       <p>This invitation will expire on {{expiryDateFmt}}.</p>
+       <p>If you were not expecting this invitation, you can safely ignore this email.</p>
+       <br/>
+       <p>Thanks,</p>
+       <p>The {{appName}} Team</p>
+     </body>
+     </html>', NULL, NULL);
+
+-- Global Parental Control Defaults
+-- Ensures a default row exists. If an admin updates via API, that will overwrite this.
+DELETE FROM global_parental_control_defaults WHERE id = 1;
+INSERT INTO global_parental_control_defaults (id, settings_json, updated_by_super_admin_id, updated_at)
+VALUES (1, '{"dnd_start_time":"22:00","dnd_end_time":"07:00","disable_media_uploads":false,"screen_time_limit_minutes":120}', 'system_default', datetime('now'));
 
 -- Third-Party Integrations (Placeholders - Requires manual encryption and actual values for production)
 -- Note: For encrypted fields, the value 'PLACEHOLDER_ENCRYPTED_...' should be replaced with actual encrypted data.
