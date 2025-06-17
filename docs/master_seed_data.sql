@@ -35,6 +35,12 @@ INSERT OR IGNORE INTO email_templates (template_name, subject_template, body_htm
      </body>
      </html>', NULL, NULL);
 
+-- Global Parental Control Defaults
+-- Ensures a default row exists. If an admin updates via API, that will overwrite this.
+DELETE FROM global_parental_control_defaults WHERE id = 1;
+INSERT INTO global_parental_control_defaults (id, settings_json, updated_by_super_admin_id, updated_at)
+VALUES (1, '{"dnd_start_time":"22:00","dnd_end_time":"07:00","disable_media_uploads":false,"screen_time_limit_minutes":120}', 'system_default', datetime('now'));
+
 -- Third-Party Integrations (Placeholders - Requires manual encryption and actual values for production)
 -- Note: For encrypted fields, the value 'PLACEHOLDER_ENCRYPTED_...' should be replaced with actual encrypted data.
 -- For this seed, we are inserting NULL or placeholder text as direct encryption isn't feasible here.

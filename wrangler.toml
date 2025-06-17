@@ -12,7 +12,7 @@ migrations = true # Ensure this line is present or added
 
 [migrations]
 dir = "./migrations" # Specifies the directory for all migrations (D1 .sql files, DO new_classes)
-tag = "v17_user_public_keys_table" # Updated tag for user public keys table
+tag = "v19_child_activity_logs" # Updated tag for child activity logs table
 new_classes = ["MyDurableObject", "ConversationDurableObject", "VideoCallSignalingDO"] # Add new DO
 
 [durable_objects]
